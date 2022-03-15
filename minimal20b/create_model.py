@@ -8,10 +8,20 @@ from minimal20b.constants import Args20b, ArgsDummy
 
 
 def create_model(checkpoint_path, use_cache=False, device=torch.device("cuda:0")):
+    """
+    To prevent allocation memory on CPU, we initialize on 'meta' and individually
+    port each module over to 'device' as we load each state dict.
+
+    :param checkpoint_path: Path to the checkpoint folder
+    :param use_cache: whether to use cache (i.e. for efficient generation)
+    :param device: device that you want the model to end up on
+    :return: model
+    """
     # Instantiate model
     pbar = tqdm_lib.tqdm(total=48)
-    pbar.set_description("Instantiating model (takes ~1 min)")
-    model = model20b.NeoX20BModel(Args20b, use_cache=use_cache).half().to(device)
+    pbar.set_description("Instantiating model")
+    model = model20b.NeoX20BModel(Args20b, use_cache=use_cache, device="meta")
+    model = model.half().to_empty(device=device)
     pbar.update(1)
 
     # Load transformer layers
@@ -42,8 +52,7 @@ def create_model(checkpoint_path, use_cache=False, device=torch.device("cuda:0")
 
     # Load output embedding
     pbar.set_description(f"Loading output embedding")
-    loaded = torch.load(os.path.join(checkpoint_path, "layer_48-model_00-model_states.pt")
-                        )
+    loaded = torch.load(os.path.join(checkpoint_path, "layer_48-model_00-model_states.pt"))
     model.logits_out.load_state_dict({
         "weight": loaded["final_linear.weight"],
     })

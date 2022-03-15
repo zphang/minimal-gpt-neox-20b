@@ -8,21 +8,23 @@ import minimal20b.rotary as rotary
 
 
 class NeoX20BModel(nn.Module):
-    def __init__(self, args, use_cache=False):
+    def __init__(self, args, use_cache=False, device=None):
         super().__init__()
         self.use_cache = use_cache
-        self.embed_in = nn.Embedding(args.vocab_size, args.hidden_size)
+        self.embed_in = nn.Embedding(args.vocab_size, args.hidden_size, device=device)
         self.layer_list = nn.ModuleList([])
         for layer_i in range(args.num_layers):
-            self.layer_list.append(TransformerLayer(args, use_cache))
+            self.layer_list.append(TransformerLayer(args, use_cache, device=device))
         self.final_layer_norm = nn.LayerNorm(
             args.hidden_size,
-            eps=args.layernorm_epsilon
+            eps=args.layernorm_epsilon,
+            device=device,
         )
         self.logits_out = nn.Linear(
             args.hidden_size,
             args.vocab_size,
             bias=False,
+            device=device,
         )
 
     def forward(self, x, attention_mask, layer_past=None):
@@ -52,18 +54,20 @@ class NeoX20BModel(nn.Module):
 
 
 class TransformerLayer(nn.Module):
-    def __init__(self, args, use_cache):
+    def __init__(self, args, use_cache, device=None):
         super().__init__()
         self.use_cache = use_cache
         self.input_layernorm = nn.LayerNorm(
             args.hidden_size,
-            eps=args.layernorm_epsilon
+            eps=args.layernorm_epsilon,
+            device=device,
         )
         self.post_attention_layernorm = nn.LayerNorm(
             args.hidden_size,
-            eps=args.layernorm_epsilon
+            eps=args.layernorm_epsilon,
+            device=device,
         )
-        self.attention = SelfAttention(args, self.use_cache)
+        self.attention = SelfAttention(args, self.use_cache, device=device)
         self.mlp = MLP(args)
 
     def forward(self, x, attention_mask, layer_past=None):
@@ -82,7 +86,7 @@ class TransformerLayer(nn.Module):
 
 
 class SelfAttention(nn.Module):
-    def __init__(self, args, use_cache=False):
+    def __init__(self, args, use_cache=False, device=None):
         super().__init__()
         self.hidden_size = args.hidden_size
         self.use_cache = use_cache
@@ -92,15 +96,18 @@ class SelfAttention(nn.Module):
         self.rotary_emb = rotary.RotaryEmbedding(
             self.rotary_ndims,
             base=args.rotary_emb_base,
+            device=device,
         )
         self.query_key_value = nn.Linear(
             args.hidden_size,
             3 * args.hidden_size,
+            device=device,
         )
         self.norm_factor = math.sqrt(self.hidden_size_per_attention_head)
         self.dense = LinearSkipAddBias(
             args.hidden_size,
             args.hidden_size,
+            device=device,
         )
 
     def forward(self, hidden_states, attention_mask, layer_past=None):
@@ -274,16 +281,18 @@ class SelfAttention(nn.Module):
 
 
 class MLP(nn.Module):
-    def __init__(self, args):
+    def __init__(self, args, device=None):
         super().__init__()
         ff_dim = 4 * args.hidden_size
         self.dense_h_to_4h = LinearSkipAddBias(
             args.hidden_size,
             ff_dim,
+            device=device,
         )
         self.dense_4h_to_h = LinearSkipAddBias(
             ff_dim,
             args.hidden_size,
+            device=device,
         )
 
     def forward(self, hidden_states):
@@ -297,12 +306,12 @@ class MLP(nn.Module):
 
 
 class LinearSkipAddBias(nn.Module):
-    def __init__(self, in_features: int, out_features: int):
+    def __init__(self, in_features: int, out_features: int, device=None):
         super().__init__()
         self.in_features = in_features
         self.out_features = out_features
-        self.weight = nn.Parameter(torch.Tensor(out_features, in_features))
-        self.bias = nn.Parameter(torch.Tensor(out_features))
+        self.weight = nn.Parameter(torch.empty((out_features, in_features), device=device))
+        self.bias = nn.Parameter(torch.empty(out_features, device=device))
 
     def forward(self, x: Tensor):
         return F.linear(x, self.weight), self.bias
