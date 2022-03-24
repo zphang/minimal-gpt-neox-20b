@@ -1,7 +1,5 @@
 import torch.nn as nn
-import torch.nn.functional as F
 import torch
-from torch import Tensor
 import math
 
 import minimal20b.rotary as rotary
@@ -73,15 +71,13 @@ class TransformerLayer(nn.Module):
     def forward(self, x, attention_mask, layer_past=None):
         residual = x
         layernorm_output = self.input_layernorm(x)
-        attention_output, attention_bias, kv_cache = self.attention(
+        attention_output, kv_cache = self.attention(
             layernorm_output,
             attention_mask,
             layer_past=layer_past,
         )
-        attention_output = attention_output + attention_bias.expand_as(attention_output)
-        mlp_output, mlp_bias = self.mlp(self.post_attention_layernorm(x))
-        output = mlp_output + mlp_bias.expand_as(mlp_output) + attention_output
-        output = residual + output
+        mlp_output = self.mlp(self.post_attention_layernorm(x))
+        output = residual + mlp_output + attention_output
         return output, kv_cache
 
 
@@ -104,7 +100,7 @@ class SelfAttention(nn.Module):
             device=device,
         )
         self.norm_factor = math.sqrt(self.hidden_size_per_attention_head)
-        self.dense = LinearSkipAddBias(
+        self.dense = nn.Linear(
             args.hidden_size,
             args.hidden_size,
             device=device,
@@ -179,9 +175,9 @@ class SelfAttention(nn.Module):
         # =================
         # Output. [sq, b, h]
         # =================
-        output, bias = self.dense(context_layer)
+        output = self.dense(context_layer)
 
-        return output, bias, kv_cache
+        return output, kv_cache
 
     def attention(self, query_layer, key_layer, value_layer, attention_mask):
         # ===================================
@@ -284,37 +280,22 @@ class MLP(nn.Module):
     def __init__(self, args, device=None):
         super().__init__()
         ff_dim = 4 * args.hidden_size
-        self.dense_h_to_4h = LinearSkipAddBias(
+        self.dense_h_to_4h = nn.Linear(
             args.hidden_size,
             ff_dim,
             device=device,
         )
-        self.dense_4h_to_h = LinearSkipAddBias(
+        self.dense_4h_to_h = nn.Linear(
             ff_dim,
             args.hidden_size,
             device=device,
         )
 
     def forward(self, hidden_states):
-        intermediate_parallel, bias_parallel = self.dense_h_to_4h(hidden_states)
-        intermediate_parallel = bias_gelu_impl(
-            intermediate_parallel,
-            bias_parallel,
-        )
-        output, output_bias = self.dense_4h_to_h(intermediate_parallel)
-        return output, output_bias
-
-
-class LinearSkipAddBias(nn.Module):
-    def __init__(self, in_features: int, out_features: int, device=None):
-        super().__init__()
-        self.in_features = in_features
-        self.out_features = out_features
-        self.weight = nn.Parameter(torch.empty((out_features, in_features), device=device))
-        self.bias = nn.Parameter(torch.empty(out_features, device=device))
-
-    def forward(self, x: Tensor):
-        return F.linear(x, self.weight), self.bias
+        intermediate_parallel = self.dense_h_to_4h(hidden_states)
+        intermediate_parallel = bias_gelu_impl(intermediate_parallel)
+        output = self.dense_4h_to_h(intermediate_parallel)
+        return output
 
 
 # noinspection PyAbstractClass
@@ -322,15 +303,15 @@ class GeLUFunction(torch.autograd.Function):
     # noinspection PyMethodOverriding
     @staticmethod
     # bias is an optional argument
-    def forward(ctx, inputs, bias):
-        ctx.save_for_backward(inputs, bias)
-        return bias_gelu(bias, inputs)
+    def forward(ctx, inputs):
+        ctx.save_for_backward(inputs)
+        return gelu(inputs)
 
     # noinspection PyMethodOverriding
     @staticmethod
     def backward(ctx, grad_output):
-        inputs, bias = ctx.saved_tensors
-        tmp = bias_gelu_back(grad_output, bias, inputs)
+        inputs = ctx.saved_tensors
+        tmp = gelu_back(grad_output, inputs)
         return tmp, tmp
 
 
@@ -347,8 +328,7 @@ def attention_mask_func(attention_scores, ltor_mask):
 
 
 # @torch.jit.script
-def bias_gelu(bias, y):
-    x = bias + y
+def gelu(x):
     return x * 0.5 * (1.0 + torch.tanh(0.79788456 * x * (1 + 0.044715 * x * x)))
 
 
@@ -356,8 +336,7 @@ def bias_gelu(bias, y):
 # gradient of actual gelu is:
 # 0.5 * (1. + torch.erf(x * 0.70710678)) + 0.3989423 * x * torch.exp(-0.5 * x * x)
 # @torch.jit.script
-def bias_gelu_back(g, bias, y):
-    x = bias + y
+def gelu_back(g, x):
     tanh_out = torch.tanh(0.79788456 * x * (1 + 0.044715 * x * x))
     # sqrt(2/pi) * 3 * 0.044715 -> 0.1070322243
     ff = 0.5 * x * (

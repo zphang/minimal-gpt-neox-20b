@@ -19,7 +19,7 @@ def create_model(checkpoint_path, use_cache=False, device=torch.device("cuda:0")
     """
     # Instantiate model
     pbar = tqdm_lib.tqdm(total=48)
-    pbar.set_description("Instantiating model")
+    pbar.set_description("Instantiating model (~1 min)")
     model = model20b.NeoX20BModel(Args20b, use_cache=use_cache, device="meta")
     model = model.half().to_empty(device=device)
     pbar.update(1)
