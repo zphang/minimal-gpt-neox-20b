@@ -27,36 +27,75 @@ def create_model(checkpoint_path, use_cache=False, device=torch.device("cuda:0")
     # Load transformer layers
     for layer_i in range(Args20b.num_layers):
         pbar.set_description(f"Loading layer {layer_i}")
-        filename = f"layer_{layer_i + 2:02d}-model_00-model_states.pt"
-        loaded = torch.load(os.path.join(checkpoint_path, filename))
-        model.layer_list[layer_i].load_state_dict(loaded)
-        del loaded
+        filename_tp1 = f"layer_{layer_i + 2:02d}-model_00-model_states.pt"
+        filename_tp2 = f"layer_{layer_i + 2:02d}-model_01-model_states.pt"
+        loaded_tp1 = torch.load(os.path.join(checkpoint_path, filename_tp1))
+        loaded_tp2 = torch.load(os.path.join(checkpoint_path, filename_tp2))
+        state_dict = {}
+        # Keys where we concatenate on the first dim
+        for key in [
+            "attention.query_key_value.weight",
+            "attention.query_key_value.bias",
+            "mlp.dense_h_to_4h.weight",
+            "mlp.dense_h_to_4h.bias",
+        ]:
+            state_dict[key] = torch.cat([loaded_tp1[key], loaded_tp2[key]], dim=0)
+        # Keys where we concatenate on the second dim
+        for key in [
+            "attention.dense.weight",
+            "mlp.dense_4h_to_h.weight",
+        ]:
+            state_dict[key] = torch.cat([loaded_tp1[key], loaded_tp2[key]], dim=1)
+        # Keys where we just take the first replica
+        for key in [
+            "input_layernorm.weight",
+            "input_layernorm.bias",
+            "post_attention_layernorm.weight",
+            "post_attention_layernorm.bias",
+            "attention.rotary_emb.inv_freq",
+        ]:
+            state_dict[key] = loaded_tp1[key]
+        # Special handling for replica-based weights
+        state_dict["mlp.dense_4h_to_h.bias_replica_1"] = loaded_tp1["mlp.dense_4h_to_h.bias"]
+        state_dict["mlp.dense_4h_to_h.bias_replica_2"] = loaded_tp2["mlp.dense_4h_to_h.bias"]
+        state_dict["attention.dense.bias_replica_1"] = loaded_tp1["attention.dense.bias"]
+        state_dict["attention.dense.bias_replica_2"] = loaded_tp2["attention.dense.bias"]
+        del loaded_tp1
+        del loaded_tp2
         pbar.update(1)
 
     # Load input embedding
     pbar.set_description(f"Loading input embedding")
-    loaded = torch.load(os.path.join(checkpoint_path, "layer_00-model_00-model_states.pt"))
-    model.embed_in.load_state_dict({"weight": loaded["word_embeddings.weight"]})
-    del loaded
+    loaded_tp1 = torch.load(os.path.join(checkpoint_path, "layer_00-model_00-model_states.pt"))
+    loaded_tp2 = torch.load(os.path.join(checkpoint_path, "layer_00-model_01-model_states.pt"))
+    model.embed_in.load_state_dict({"weight": torch.cat([
+        loaded_tp1["word_embeddings.weight"],
+        loaded_tp2["word_embeddings.weight"],
+    ], dim=0)})
+    del loaded_tp1
+    del loaded_tp2
     pbar.update(1)
 
-    # Load final layer norm
+    # Load final layer norm (only load replica 1)
     pbar.set_description(f"Loading final layer norm")
-    loaded = torch.load(os.path.join(checkpoint_path, "layer_47-model_00-model_states.pt"))
+    loaded_tp1 = torch.load(os.path.join(checkpoint_path, "layer_47-model_00-model_states.pt"))
     model.final_layer_norm.load_state_dict({
-        "weight": loaded["norm.weight"],
-        "bias": loaded["norm.bias"],
+        "weight": loaded_tp1["norm.weight"],
+        "bias": loaded_tp1["norm.bias"],
     })
-    del loaded
+    del loaded_tp1
     pbar.update(1)
 
     # Load output embedding
     pbar.set_description(f"Loading output embedding")
-    loaded = torch.load(os.path.join(checkpoint_path, "layer_48-model_00-model_states.pt"))
-    model.logits_out.load_state_dict({
-        "weight": loaded["final_linear.weight"],
-    })
-    del loaded
+    loaded_tp1 = torch.load(os.path.join(checkpoint_path, "layer_48-model_00-model_states.pt"))
+    loaded_tp2 = torch.load(os.path.join(checkpoint_path, "layer_48-model_01-model_states.pt"))
+    model.embed_in.load_state_dict({"weight": torch.cat([
+        loaded_tp1["final_linear.weight"],
+        loaded_tp2["final_linear.weight"],
+    ], dim=0)})
+    del loaded_tp1
+    del loaded_tp2
     pbar.update(1)
     pbar.set_description("Done.")
 

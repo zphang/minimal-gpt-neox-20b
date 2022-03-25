@@ -1,5 +1,6 @@
 import torch.nn as nn
 import torch
+import torch.nn.functional as F
 import math
 
 import minimal20b.rotary as rotary
@@ -100,7 +101,7 @@ class SelfAttention(nn.Module):
             device=device,
         )
         self.norm_factor = math.sqrt(self.hidden_size_per_attention_head)
-        self.dense = nn.Linear(
+        self.dense = LinearWithTPSplitBias(
             args.hidden_size,
             args.hidden_size,
             device=device,
@@ -285,7 +286,7 @@ class MLP(nn.Module):
             ff_dim,
             device=device,
         )
-        self.dense_4h_to_h = nn.Linear(
+        self.dense_4h_to_h = LinearWithTPSplitBias(
             ff_dim,
             args.hidden_size,
             device=device,
@@ -296,6 +297,47 @@ class MLP(nn.Module):
         intermediate_parallel = bias_gelu_impl(intermediate_parallel)
         output = self.dense_4h_to_h(intermediate_parallel)
         return output
+
+
+class LinearWithTPSplitBias(nn.Module):
+    def __init__(self, in_features: int, out_features: int, device=None):
+        super().__init__()
+        self.in_features = in_features
+        self.out_features = out_features
+        self.weight = nn.Parameter(torch.empty((out_features, in_features), device=device))
+        self.bias_replica_1 = nn.Parameter(torch.empty(out_features, device=device))
+        self.bias_replica_2 = nn.Parameter(torch.empty(out_features, device=device))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        split_size = x.shape[-1] // 2
+        x_replica_1, x_replica_2 = torch.split(x, split_size, dim=-1)
+        y_replica_1 = F.linear(x_replica_1, self.weight, self.bias_replica_1)
+        y_replica_2 = F.linear(x_replica_2, self.weight, self.bias_replica_2)
+        return torch.cat([y_replica_1, y_replica_2], dim=-1)
+
+
+class LayerNormWithTPSplit(nn.Module):
+    def __init__(self, hidden_size: int, layernorm_epsilon: int, device=None):
+        super().__init__()
+        self.hidden_size = hidden_size
+        self.layernorm_epsilon = layernorm_epsilon
+        self.layer_norm_replica_1 = nn.LayerNorm(
+            hidden_size,
+            eps=layernorm_epsilon,
+            device=device,
+        )
+        self.layer_norm_replica_2 = nn.LayerNorm(
+            hidden_size,
+            eps=layernorm_epsilon,
+            device=device,
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        split_size = x.shape[-1] // 2
+        x_replica_1, x_replica_2 = torch.split(x, split_size, dim=-1)
+        y_replica_1 = self.layer_norm_replica_1(x_replica_1)
+        y_replica_2 = self.layer_norm_replica_2(x_replica_2)
+        return torch.cat([y_replica_1, y_replica_2], dim=-1)
 
 
 # noinspection PyAbstractClass
