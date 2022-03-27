@@ -32,34 +32,42 @@ def create_model(checkpoint_path, use_cache=False, device=torch.device("cuda:0")
         loaded_tp1 = torch.load(os.path.join(checkpoint_path, filename_tp1))
         loaded_tp2 = torch.load(os.path.join(checkpoint_path, filename_tp2))
         state_dict = {}
-        # Keys where we concatenate on the first dim
-        for key in [
-            "attention.query_key_value.weight",
-            "attention.query_key_value.bias",
-            "mlp.dense_h_to_4h.weight",
-            "mlp.dense_h_to_4h.bias",
-        ]:
-            state_dict[key] = torch.cat([loaded_tp1[key], loaded_tp2[key]], dim=0)
+        # Good
         # Keys where we concatenate on the second dim
         for key in [
             "attention.dense.weight",
             "mlp.dense_4h_to_h.weight",
         ]:
             state_dict[key] = torch.cat([loaded_tp1[key], loaded_tp2[key]], dim=1)
-        # Keys where we just take the first replica
-        for key in [
-            "input_layernorm.weight",
-            "input_layernorm.bias",
-            "post_attention_layernorm.weight",
-            "post_attention_layernorm.bias",
-            "attention.rotary_emb.inv_freq",
-        ]:
-            state_dict[key] = loaded_tp1[key]
-        # Special handling for replica-based weights
+        # Mapping individual split weights to custom split implementations
+        # Layer Norms
+        state_dict["input_layernorm.layer_norm_replica_1.weight"] = loaded_tp1["input_layernorm.weight"]
+        state_dict["input_layernorm.layer_norm_replica_2.weight"] = loaded_tp2["input_layernorm.weight"]
+        state_dict["input_layernorm.layer_norm_replica_1.bias"] = loaded_tp1["input_layernorm.bias"]
+        state_dict["input_layernorm.layer_norm_replica_2.bias"] = loaded_tp2["input_layernorm.bias"]
+        state_dict["post_attention_layernorm.layer_norm_replica_1.weight"] = \
+            loaded_tp1["post_attention_layernorm.weight"]
+        state_dict["post_attention_layernorm.layer_norm_replica_2.weight"] = \
+            loaded_tp2["post_attention_layernorm.weight"]
+        state_dict["post_attention_layernorm.layer_norm_replica_1.bias"] = loaded_tp1["post_attention_layernorm.bias"]
+        state_dict["post_attention_layernorm.layer_norm_replica_2.bias"] = loaded_tp2["post_attention_layernorm.bias"]
+        # LinearWithTPMerge
+        state_dict["mlp.dense_h_to_4h.linear_split_1.weight"] = loaded_tp1["mlp.dense_h_to_4h.weight"]
+        state_dict["mlp.dense_h_to_4h.linear_split_2.weight"] = loaded_tp2["mlp.dense_h_to_4h.weight"]
+        state_dict["mlp.dense_h_to_4h.linear_split_1.bias"] = loaded_tp1["mlp.dense_h_to_4h.bias"]
+        state_dict["mlp.dense_h_to_4h.linear_split_2.bias"] = loaded_tp2["mlp.dense_h_to_4h.bias"]
+        state_dict["attention.query_key_value.linear_split_1.weight"] = loaded_tp1["attention.query_key_value.weight"]
+        state_dict["attention.query_key_value.linear_split_2.weight"] = loaded_tp2["attention.query_key_value.weight"]
+        state_dict["attention.query_key_value.linear_split_1.bias"] = loaded_tp1["attention.query_key_value.bias"]
+        state_dict["attention.query_key_value.linear_split_2.bias"] = loaded_tp2["attention.query_key_value.bias"]
+        # LinearWithTPSplitBias
         state_dict["mlp.dense_4h_to_h.bias_replica_1"] = loaded_tp1["mlp.dense_4h_to_h.bias"]
         state_dict["mlp.dense_4h_to_h.bias_replica_2"] = loaded_tp2["mlp.dense_4h_to_h.bias"]
         state_dict["attention.dense.bias_replica_1"] = loaded_tp1["attention.dense.bias"]
         state_dict["attention.dense.bias_replica_2"] = loaded_tp2["attention.dense.bias"]
+        # Just take one
+        state_dict["attention.rotary_emb.inv_freq"] = loaded_tp1["attention.rotary_emb.inv_freq"]
+        model.layer_list[layer_i].load_state_dict(state_dict)
         del loaded_tp1
         del loaded_tp2
         pbar.update(1)
@@ -76,24 +84,28 @@ def create_model(checkpoint_path, use_cache=False, device=torch.device("cuda:0")
     del loaded_tp2
     pbar.update(1)
 
-    # Load final layer norm (only load replica 1)
+    # Load final layer norm
     pbar.set_description(f"Loading final layer norm")
     loaded_tp1 = torch.load(os.path.join(checkpoint_path, "layer_47-model_00-model_states.pt"))
+    loaded_tp2 = torch.load(os.path.join(checkpoint_path, "layer_47-model_01-model_states.pt"))
     model.final_layer_norm.load_state_dict({
-        "weight": loaded_tp1["norm.weight"],
-        "bias": loaded_tp1["norm.bias"],
+        "layer_norm_replica_1.weight": loaded_tp1["norm.weight"],
+        "layer_norm_replica_2.weight": loaded_tp2["norm.weight"],
+        "layer_norm_replica_1.bias": loaded_tp1["norm.bias"],
+        "layer_norm_replica_2.bias": loaded_tp2["norm.bias"],
     })
     del loaded_tp1
+    del loaded_tp2
     pbar.update(1)
 
     # Load output embedding
     pbar.set_description(f"Loading output embedding")
     loaded_tp1 = torch.load(os.path.join(checkpoint_path, "layer_48-model_00-model_states.pt"))
     loaded_tp2 = torch.load(os.path.join(checkpoint_path, "layer_48-model_01-model_states.pt"))
-    model.embed_in.load_state_dict({"weight": torch.cat([
-        loaded_tp1["final_linear.weight"],
-        loaded_tp2["final_linear.weight"],
-    ], dim=0)})
+    model.logits_out.load_state_dict({
+        "linear_split_1.weight": loaded_tp1["final_linear.weight"],
+        "linear_split_2.weight": loaded_tp2["final_linear.weight"],
+    })
     del loaded_tp1
     del loaded_tp2
     pbar.update(1)
