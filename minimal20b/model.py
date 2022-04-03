@@ -1,9 +1,7 @@
 import torch.nn as nn
 import torch
-import torch.nn.functional as F
 import math
 
-from typing import Tuple
 import minimal20b.rotary as rotary
 
 
@@ -20,7 +18,7 @@ class NeoX20BModel(nn.Module):
             eps=args.layernorm_epsilon,
             device=device,
         )
-        self.logits_out = LinearWithTPMerge(
+        self.logits_out = nn.Linear(
             args.hidden_size,
             args.vocab_size,
             bias=False,
@@ -101,7 +99,7 @@ class SelfAttention(nn.Module):
             base=args.rotary_emb_base,
             device=device,
         )
-        self.query_key_value = LinearWithTPMerge(
+        self.query_key_value = nn.Linear(
             args.hidden_size,
             3 * args.hidden_size,
             device=device,
@@ -113,14 +111,12 @@ class SelfAttention(nn.Module):
             device=device,
         )
 
-    def forward(self, hidden_states_replica_1, attention_mask, layer_past=None):
+    def forward(self, hidden_states, attention_mask, layer_past=None):
         has_layer_past = layer_past is not None and layer_past.numel() > 0
 
         # Compute QKV
         # Attention heads [sq, b, h] --> [sq, b, (np * 3 * hn)]
-        qkv = self.query_key_value(
-            x=hidden_states_replica_1,
-        )
+        qkv = self.query_key_value(hidden_states)
 
         # [sq, b, (np * 3 * hn)] --> [sq, b, np, 3 * hn]
         new_qkv_shape = qkv.size()[:-1] + (
@@ -289,78 +285,14 @@ class MLP(nn.Module):
     def __init__(self, args, device=None):
         super().__init__()
         ff_dim = 4 * args.hidden_size
-        self.dense_h_to_4h = LinearWithTPMerge(
-            args.hidden_size,
-            ff_dim,
-            device=device,
-        )
-        self.dense_4h_to_h = nn.Linear(
-            ff_dim,
-            args.hidden_size,
-            device=device,
-        )
+        self.dense_h_to_4h = nn.Linear(args.hidden_size, ff_dim, device=device)
+        self.dense_4h_to_h = nn.Linear(ff_dim, args.hidden_size, device=device)
 
     def forward(self, hidden_states):
-        intermediate_parallel = self.dense_h_to_4h(x=hidden_states)
+        intermediate_parallel = self.dense_h_to_4h(hidden_states)
         intermediate_parallel = bias_gelu_impl(intermediate_parallel)
         output = self.dense_4h_to_h(intermediate_parallel)
         return output
-
-
-class LinearWithTPMerge(nn.Module):
-
-    def __init__(self, in_features: int, out_features: int, bias=True, device=None):
-        super().__init__()
-        self.in_features = in_features
-        self.out_features = out_features
-        half_out_features = self.out_features // 2
-        self.linear_split_1 = nn.Linear(in_features, half_out_features, bias=bias, device=device)
-        self.linear_split_2 = nn.Linear(in_features, half_out_features, bias=bias, device=device)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        output_from_replica_1 = self.linear_split_1(x)
-        output_from_replica_2 = self.linear_split_2(x)
-        merged_output = torch.cat([output_from_replica_1, output_from_replica_2], dim=-1)
-        return merged_output
-
-
-class LinearWithTPSplitBias(nn.Module):
-    def __init__(self, in_features: int, out_features: int, device=None):
-        super().__init__()
-        self.in_features = in_features
-        self.out_features = out_features
-        self.weight = nn.Parameter(torch.empty((out_features, in_features), device=device))
-        # self.bias_replica_1 = nn.Parameter(torch.empty(out_features, device=device))
-        # self.bias_replica_2 = nn.Parameter(torch.empty(out_features, device=device))
-        self.bias = nn.Parameter(torch.empty(out_features, device=device))
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # y_replica_1 = F.linear(x, self.weight, self.bias_replica_1)
-        # y_replica_2 = F.linear(x, self.weight, self.bias_replica_2)
-        # return y_replica_1, y_replica_2
-        return F.linear(x, self.weight, self.bias)
-
-
-class LayerNormWithTPDuplication(nn.Module):
-    def __init__(self, hidden_size: int, eps: int, device=None):
-        super().__init__()
-        self.hidden_size = hidden_size
-        self.layernorm_epsilon = eps
-        self.layer_norm_replica_1 = nn.LayerNorm(
-            hidden_size,
-            eps=eps,
-            device=device,
-        )
-        self.layer_norm_replica_2 = nn.LayerNorm(
-            hidden_size,
-            eps=eps,
-            device=device,
-        )
-
-    def forward(self, x_replica_1: torch.Tensor, x_replica_2: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        y_replica_1 = self.layer_norm_replica_1(x_replica_1)
-        y_replica_2 = self.layer_norm_replica_2(x_replica_2)
-        return y_replica_1, y_replica_2
 
 
 # noinspection PyAbstractClass
@@ -392,7 +324,7 @@ def attention_mask_func(attention_scores, ltor_mask):
     return attention_scores
 
 
-# @torch.jit.script
+@torch.jit.script
 def gelu(x):
     return x * 0.5 * (1.0 + torch.tanh(0.79788456 * x * (1 + 0.044715 * x * x)))
 
@@ -400,7 +332,7 @@ def gelu(x):
 # gradient of tanh approximation of gelu
 # gradient of actual gelu is:
 # 0.5 * (1. + torch.erf(x * 0.70710678)) + 0.3989423 * x * torch.exp(-0.5 * x * x)
-# @torch.jit.script
+@torch.jit.script
 def gelu_back(g, x):
     tanh_out = torch.tanh(0.79788456 * x * (1 + 0.044715 * x * x))
     # sqrt(2/pi) * 3 * 0.044715 -> 0.1070322243
