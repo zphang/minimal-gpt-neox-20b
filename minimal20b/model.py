@@ -15,7 +15,7 @@ class NeoX20BModel(nn.Module):
         self.layer_list = nn.ModuleList([])
         for layer_i in range(args.num_layers):
             self.layer_list.append(TransformerLayer(args, use_cache, device=device))
-        self.final_layer_norm = LayerNormWithTPDuplication(
+        self.final_layer_norm = nn.LayerNorm(
             args.hidden_size,
             eps=args.layernorm_epsilon,
             device=device,
@@ -33,22 +33,16 @@ class NeoX20BModel(nn.Module):
         kv_cache_list = []
         hidden_states = self.embed_in(x)
         hidden_states = self.pre_transformer_transpose(hidden_states)
-        hidden_states_replica_1, hidden_states_replica_2 = hidden_states, hidden_states
         for layer_i, layer in enumerate(self.layer_list):
-            (hidden_states_replica_1, hidden_states_replica_2), kv_cache = layer(
-                x_replica_1=hidden_states_replica_1,
-                x_replica_2=hidden_states_replica_2,
+            hidden_states, kv_cache = layer(
+                x=hidden_states,
                 attention_mask=attention_mask,
                 layer_past=layer_past[layer_i],
             )
             kv_cache_list.append(kv_cache)
-        hidden_states_replica_1 = self.post_transformer_transpose(hidden_states_replica_1)
-        hidden_states_replica_2 = self.post_transformer_transpose(hidden_states_replica_2)
-        hidden_states_replica_1, hidden_states_replica_2 = self.final_layer_norm(
-            hidden_states_replica_1,
-            hidden_states_replica_2,
-        )
-        logits = self.logits_out(hidden_states_replica_1, hidden_states_replica_2)
+        hidden_states = self.post_transformer_transpose(hidden_states)
+        hidden_states = self.final_layer_norm(hidden_states)
+        logits = self.logits_out(hidden_states)
         if self.use_cache:
             return logits, kv_cache_list
         else:
@@ -67,12 +61,12 @@ class TransformerLayer(nn.Module):
     def __init__(self, args, use_cache, device=None):
         super().__init__()
         self.use_cache = use_cache
-        self.input_layernorm = LayerNormWithTPDuplication(
+        self.input_layernorm = nn.LayerNorm(
             args.hidden_size,
             eps=args.layernorm_epsilon,
             device=device,
         )
-        self.post_attention_layernorm = LayerNormWithTPDuplication(
+        self.post_attention_layernorm = nn.LayerNorm(
             args.hidden_size,
             eps=args.layernorm_epsilon,
             device=device,
@@ -80,29 +74,18 @@ class TransformerLayer(nn.Module):
         self.attention = SelfAttention(args, self.use_cache, device=device)
         self.mlp = MLP(args)
 
-    def forward(self, x_replica_1, x_replica_2, attention_mask, layer_past=None):
-        residual_replica_1, residual_replica_2 = x_replica_1, x_replica_2
-        ln_output_replica_1, ln_output_replica_2 = self.input_layernorm(
-            x_replica_1,
-            x_replica_2,
-        )
-        (attention_output_replica_1, attention_output_replica_2), kv_cache = self.attention(
-            ln_output_replica_1,
-            ln_output_replica_2,
+    def forward(self, x, attention_mask, layer_past=None):
+        residual = x
+        ln_output = self.input_layernorm(x)
+        attention_output, kv_cache = self.attention(
+            ln_output,
             attention_mask,
             layer_past=layer_past,
         )
-        post_attn_ln_replica_1, post_attn_ln_replica_2 = self.post_attention_layernorm(
-            x_replica_1,
-            x_replica_2,
-        )
-        mlp_output_replica_1, mlp_output_replica_2 = self.mlp(
-            hidden_states_replica_1=post_attn_ln_replica_1,
-            hidden_states_replica_2=post_attn_ln_replica_2,
-        )
-        output_replica_1 = residual_replica_1 + mlp_output_replica_1 + attention_output_replica_1
-        output_replica_2 = residual_replica_2 + mlp_output_replica_2 + attention_output_replica_2
-        return (output_replica_1, output_replica_2), kv_cache
+        post_attn_ln = self.post_attention_layernorm(x)
+        mlp_output = self.mlp(hidden_states=post_attn_ln)
+        output = residual + mlp_output + attention_output
+        return output, kv_cache
 
 
 class SelfAttention(nn.Module):
@@ -124,20 +107,19 @@ class SelfAttention(nn.Module):
             device=device,
         )
         self.norm_factor = math.sqrt(self.hidden_size_per_attention_head)
-        self.dense = LinearWithTPSplitBias(
+        self.dense = nn.Linear(
             args.hidden_size,
             args.hidden_size,
             device=device,
         )
 
-    def forward(self, hidden_states_replica_1, hidden_states_replica_2, attention_mask, layer_past=None):
+    def forward(self, hidden_states_replica_1, attention_mask, layer_past=None):
         has_layer_past = layer_past is not None and layer_past.numel() > 0
 
         # Compute QKV
         # Attention heads [sq, b, h] --> [sq, b, (np * 3 * hn)]
         qkv = self.query_key_value(
-            x_replica_1=hidden_states_replica_1,
-            x_replica_2=hidden_states_replica_2,
+            x=hidden_states_replica_1,
         )
 
         # [sq, b, (np * 3 * hn)] --> [sq, b, np, 3 * hn]
@@ -202,9 +184,9 @@ class SelfAttention(nn.Module):
         # =================
         # Output. [sq, b, h]
         # =================
-        output_replica_1, output_replica_2 = self.dense(context_layer)
+        output = self.dense(context_layer)
 
-        return (output_replica_1, output_replica_2), kv_cache
+        return output, kv_cache
 
     def attention(self, query_layer, key_layer, value_layer, attention_mask):
         # ===================================
@@ -312,20 +294,17 @@ class MLP(nn.Module):
             ff_dim,
             device=device,
         )
-        self.dense_4h_to_h = LinearWithTPSplitBias(
+        self.dense_4h_to_h = nn.Linear(
             ff_dim,
             args.hidden_size,
             device=device,
         )
 
-    def forward(self, hidden_states_replica_1, hidden_states_replica_2):
-        intermediate_parallel = self.dense_h_to_4h(
-            x_replica_1=hidden_states_replica_1,
-            x_replica_2=hidden_states_replica_2,
-        )
+    def forward(self, hidden_states):
+        intermediate_parallel = self.dense_h_to_4h(x=hidden_states)
         intermediate_parallel = bias_gelu_impl(intermediate_parallel)
-        output_replica_1, output_replica_2 = self.dense_4h_to_h(intermediate_parallel)
-        return output_replica_1, output_replica_2
+        output = self.dense_4h_to_h(intermediate_parallel)
+        return output
 
 
 class LinearWithTPMerge(nn.Module):
@@ -338,9 +317,9 @@ class LinearWithTPMerge(nn.Module):
         self.linear_split_1 = nn.Linear(in_features, half_out_features, bias=bias, device=device)
         self.linear_split_2 = nn.Linear(in_features, half_out_features, bias=bias, device=device)
 
-    def forward(self, x_replica_1: torch.Tensor, x_replica_2: torch.Tensor) -> torch.Tensor:
-        output_from_replica_1 = self.linear_split_1(x_replica_1)
-        output_from_replica_2 = self.linear_split_2(x_replica_2)
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        output_from_replica_1 = self.linear_split_1(x)
+        output_from_replica_2 = self.linear_split_2(x)
         merged_output = torch.cat([output_from_replica_1, output_from_replica_2], dim=-1)
         return merged_output
 
@@ -351,13 +330,15 @@ class LinearWithTPSplitBias(nn.Module):
         self.in_features = in_features
         self.out_features = out_features
         self.weight = nn.Parameter(torch.empty((out_features, in_features), device=device))
-        self.bias_replica_1 = nn.Parameter(torch.empty(out_features, device=device))
-        self.bias_replica_2 = nn.Parameter(torch.empty(out_features, device=device))
+        # self.bias_replica_1 = nn.Parameter(torch.empty(out_features, device=device))
+        # self.bias_replica_2 = nn.Parameter(torch.empty(out_features, device=device))
+        self.bias = nn.Parameter(torch.empty(out_features, device=device))
 
-    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        y_replica_1 = F.linear(x, self.weight, self.bias_replica_1)
-        y_replica_2 = F.linear(x, self.weight, self.bias_replica_2)
-        return y_replica_1, y_replica_2
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # y_replica_1 = F.linear(x, self.weight, self.bias_replica_1)
+        # y_replica_2 = F.linear(x, self.weight, self.bias_replica_2)
+        # return y_replica_1, y_replica_2
+        return F.linear(x, self.weight, self.bias)
 
 
 class LayerNormWithTPDuplication(nn.Module):
