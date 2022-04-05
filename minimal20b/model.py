@@ -25,12 +25,22 @@ class NeoX20BModel(nn.Module):
             device=device,
         )
 
-    def forward(self, x, attention_mask, layer_past=None):
+    def forward(self, x, attention_mask=None, layer_past=None):
+        if attention_mask is None:
+            attention_mask = generate_mask(x.shape[1]).to(x.device)
+        if self.use_cache:
+            if layer_past is None:
+                kv_length = x.shape[1]
+            else:
+                kv_length = layer_past[0].shape[1] + 1
+            attention_mask = attention_mask[..., :x.shape[1], :kv_length]
+
         if layer_past is None:
             layer_past = [None] * len(self.layer_list)
         kv_cache_list = []
         hidden_states = self.embed_in(x)
         hidden_states = self.pre_transformer_transpose(hidden_states)
+
         for layer_i, layer in enumerate(self.layer_list):
             hidden_states, kv_cache = layer(
                 x=hidden_states,
@@ -227,13 +237,6 @@ class SelfAttention(nn.Module):
         # ==================================================
         # Update attention mask for inference. [b, np, sq, sk]
         # ==================================================
-
-        if self.use_cache:
-            attention_mask = attention_mask[
-                 ...,
-                 :attention_scores.size(3),
-                 :attention_scores.size(3),
-             ]
 
         # ===========================
         # Attention probs and dropout

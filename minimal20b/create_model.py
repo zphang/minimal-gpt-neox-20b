@@ -2,6 +2,7 @@ import os
 from tqdm import auto as tqdm_lib
 
 import torch
+import tokenizers
 
 import minimal20b.model as model20b
 from minimal20b.constants import Args20b, ArgsDummy
@@ -128,3 +129,7 @@ def create_model(checkpoint_path, use_cache=False, device=torch.device("cuda:0")
 def create_dummy_model(use_cache=False, device=torch.device("cpu")):
     model = model20b.NeoX20BModel(ArgsDummy, use_cache=use_cache).half().to(device)
     return model
+
+
+def create_tokenizer(tokenizer_path):
+    return tokenizers.Tokenizer.from_file(tokenizer_path)
