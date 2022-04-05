@@ -230,18 +230,18 @@ class SelfAttention(nn.Module):
 
         if self.use_cache:
             attention_mask = attention_mask[
-                             ...,
-                             :attention_scores.size(3),
-                             :attention_scores.size(3),
-                             ]
+                 ...,
+                 :attention_scores.size(3),
+                 :attention_scores.size(3),
+             ]
 
         # ===========================
         # Attention probs and dropout
         # ===========================
 
         # attention scores and attention mask [b, np, sq, sk]
-        masked_scores = attention_mask_func(attention_scores,
-                                            attention_mask) if attention_mask is not None else attention_scores
+        masked_scores = attention_mask_func(attention_scores, attention_mask) \
+            if attention_mask is not None else attention_scores
         attention_probs = torch.nn.Softmax(dim=-1)(masked_scores)
 
         #         # This is actually dropping out entire tokens to attend to, which might
@@ -316,11 +316,12 @@ bias_gelu_impl = GeLUFunction.apply
 
 
 def generate_mask(seq_len):
-    return torch.tril(torch.ones((1, 1, seq_len, seq_len))) < 0.5
+    return torch.tril(torch.ones((1, 1, seq_len, seq_len), dtype=torch.bool))
 
 
 def attention_mask_func(attention_scores, ltor_mask):
-    attention_scores.masked_fill_(ltor_mask, -10000.0)
+    """Assign -10000.0 to False cells in ltor_mask"""
+    attention_scores.masked_fill_(~ltor_mask, -10000.0)
     return attention_scores
 
 
