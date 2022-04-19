@@ -5,10 +5,13 @@ import jax
 import jax.numpy as jnp
 # noinspection PyPep8Naming
 from jax.experimental import PartitionSpec as P
+from jax.experimental.pjit import pjit
 
 import flax.linen as nn
 from flax.linen.partitioning import with_sharding_constraint as shard_to
 from flax import struct
+from flax.core import frozen_dict
+from flax import traverse_util
 
 
 @struct.dataclass
@@ -31,59 +34,7 @@ class ShardedTransformer:
 
     config: NeoX20BConfig
 
-    def compute_embedding(self, x):
-        x = shard_to(x, P("dp", None))
-        return ShardedEmbedIn(config=self.config)(x)
-
-    def compute_single_transformer_layer(self, x, mask):
-        out = x + ShardedTransformerLayer(config=self.config)(x, mask)
-        return shard_to(out, P("dp", None, "mp"))
-
-    def compute_single_transformer_layer_with_grad_checkpoint(self, x, mask):
-        return jax.checkpoint(self.compute_single_transformer_layer, prevent_cse=False)(x, mask)
-
-    def init_decode(self, x, given_length, mask):
-        residual, decode_state = ShardedTransformerLayer(
-            config=self.config,
-        ).get_init_decode_state(x, given_length, mask)
-        out = x + residual
-        return shard_to(out, P("dp", None, "mp")), decode_state
-
-    def iter_decode(self, decode_state, x):
-        residual, decode_state = ShardedTransformerLayer(
-            config=self.config,
-        ).decode_once(decode_state, x, 0)
-        out = x + residual
-        return shard_to(out, P("dp", None, "mp")), decode_state
-
-    def eval_apply_scan_fn(self, layer_in, layer_state):
-        x, mask = layer_in
-        return (self.compute_single_transformer_layer_with_grad_checkpoint(layer_state, x, mask), mask), None
-
-    # def setup(self):
-    #     self.embed_in = ShardedEmbedIn(config=self.config)
-    #     self.transformer_layer = ShardedTransformerLayer(config=self.config)
-    #     self.embed_out = ShardedEmbedOut(config=self.config)
-    #
-    # def __call__(self, params, x, mask):
-    #     embedded = self.embed_in.apply({"params": params["embed_in"]}, x)
-    #
-    #     def _transformer_layer_scan_fn(layer_in, layer_params):
-    #         h_, mask_ = layer_in["h"], layer_in["mask"]
-    #         h_out = h_ + self.transformer_layer.apply(
-    #             {"params": layer_params["transformer"]},
-    #             h_, mask_,
-    #         )
-    #         return {"h": h_out, "mask": mask_}, None
-    #
-    #     layers_out, _ = jax.lax.scan(
-    #         f=_transformer_layer_scan_fn,
-    #         init={"h": embedded, "mask": mask},
-    #         xs=params["transformer"]
-    #     )
-    #     return self.embed_out.apply({"params": params["embed_out"]}, layers_out)
-
-    def eval_apply_fn(self, params, x, mask):
+    def _eval_apply_fn(self, params, x, mask):
         embedded = ShardedEmbedIn(config=self.config).apply({"params": params["embed_in"]}, x)
 
         def _transformer_layer_scan_fn(layer_in, layer_params):
@@ -101,6 +52,221 @@ class ShardedTransformer:
         )
         layers_out = layers_out["h"]
         return ShardedEmbedOut(config=self.config).apply({"params": params["embed_out"]}, layers_out)
+
+    def eval_apply_fn_pjit(self):
+        return pjit(
+            self._eval_apply_fn,
+            in_axis_resources=(
+                self.get_sharding(),  # params
+                P("dp", None),  # input [batch, seq_len]
+                P("dp", None, None),  # mask [batch, seq_len, seq_len]
+            ),
+            out_axis_resources=P("dp", None, "tp"),  # [batch, seq_len, hidden]
+        )
+
+    def _get_initial_decode_state(self, params, ctx, ctx_length):
+        # Embed initial context
+        embedded = ShardedEmbedIn(config=self.config).apply(
+            {"params": params["embed_in"]}, ctx)
+
+        # Set up scan function for creating decode_states for each layer
+        def _transformer_layer_init_decode_scan_fn(layer_in, layer_params):
+            h_, ctx_length_ = layer_in["h"], layer_in["ctx_length"]
+            new_residual, decode_state = ShardedTransformerLayer(config=self.config).apply(
+                {"params": layer_params},
+                h_, ctx_length,
+                method=ShardedTransformerLayer.get_init_decode_state,
+            )
+            h_out = h_ + new_residual
+            return {"h": h_out, "ctx_length": ctx_length_}, decode_state
+
+        # Run scan over transformer layers
+        layers_out, init_state = jax.lax.scan(
+            f=_transformer_layer_init_decode_scan_fn,
+            init={"h": embedded, "ctx_length": ctx_length},
+            xs=params["transformer"],
+        )
+        final_logit = ShardedEmbedOut(config=self.config).apply(
+            {"params": params["embed_out"]},
+            layers_out["h"][:, -1:, :],
+        )
+
+        return {"logits": final_logit, "decode_state": init_state}
+
+    def get_initial_decode_state_pjit(self):
+        return pjit(
+            self._get_initial_decode_state,
+            in_axis_resources=(
+                self.get_sharding(),
+                P("dp", None),  # input_ids [batch, seq_len]
+                P("dp"),  # ctx_length [batch]
+            ),
+            out_axis_resources={
+                "logits": P("dp", None, "tp"),
+                "decode_state": self.get_decode_state_sharding(),
+            }
+        )
+
+    def _decode_once(self, params, single_x, decode_state):
+        assert single_x.shape[1] == 1
+        # Embed single token
+        embedded = ShardedEmbedIn(config=self.config).apply(
+            {"params": params["embed_in"]}, single_x)
+
+        # Set up scan function for doing a single decoding step for each layer
+        def _transformer_layer_decode_once_scan_fn(h, layer_params_and_decode_state):
+            layer_params, layer_decode_state = layer_params_and_decode_state
+            new_residual, new_layer_decode_state = ShardedTransformerLayer(config=self.config).apply(
+                {"params": layer_params},
+                layer_decode_state, h,
+                method=ShardedTransformerLayer.decode_once,
+            )
+            h_out = h + new_residual
+            return h_out, new_layer_decode_state
+
+        # Run scan over transformer layers
+        layers_out, new_decode_state = jax.lax.scan(
+            f=_transformer_layer_decode_once_scan_fn,
+            init=embedded,
+            xs=(params["transformer"], decode_state),
+        )
+
+        # Project to logits
+        logits = ShardedEmbedOut(config=self.config).apply(
+            {"params": params["embed_out"]},
+            layers_out,
+        )
+        return {
+            "logits": logits,
+            "new_decode_state": new_decode_state,
+        }
+
+    def decode_once_pjit(self):
+        decode_state_sharding = self.get_decode_state_sharding()
+        return pjit(
+            self._decode_once,
+            in_axis_resources=(
+                self.get_sharding(),
+                P("dp"),  # input_ids [batch, seq_len]
+                decode_state_sharding,  # decode_state
+            ),
+            out_axis_resources={
+                "logits": P("dp", None, "tp"),
+                "new_decode_state": decode_state_sharding,
+            }
+        )
+
+    def _generate(self, params, ctx, ctx_length, rng, generate_length):
+        init_out = self.get_initial_decode_state(
+            params=params,
+            ctx=ctx,
+            ctx_length=ctx_length
+        )
+        # Add sampling logic here
+        initial_token = init_out["logits"].argmax(-1)
+
+        init_carry = {
+            "single_x": initial_token,
+            "decode_state": init_out["decode_state"],
+        }
+
+        def _decode_once_scan_fn(decode_carry, rng):
+            decode_out = self.decode_once(
+                params=params,
+                single_x=decode_carry["single_x"],
+                decode_state=decode_carry["decode_state"],
+            )
+
+            # Add sampling logic here
+            next_token = decode_out["logits"].argmax(-1)
+
+            next_carry = {
+                "single_x": next_token,
+                "decode_state": decode_out["new_decode_state"]
+            }
+            outputs = {
+                "logits": decode_out["logits"],
+                "next_token": next_token,
+            }
+            return next_carry, outputs
+
+        final_state, generation_outputs = jax.lax.scan(
+            f=_decode_once_scan_fn,
+            init=init_carry,
+            xs=jax.random.split(rng, generate_length),
+        )
+        tokens = generation_outputs["next_token"].swapaxes(0, 1)[:, :, 0]
+        logits = generation_outputs["logits"].swapaxes(0, 1)[:, :, 0]
+        return {
+            # "final_state": final_state,
+            "generated_logits": jnp.concatenate((init_out["logits"], logits), axis=1),
+            "generated_tokens": jnp.concatenate((initial_token, tokens), axis=1, ),
+        }
+
+    def generate_pjit(self):
+        return pjit(
+            self._generate,
+            in_axis_resources=(
+                self.get_sharding(),
+                P("dp", None),  # ctx [batch, seq_len]
+                P("dp"),  # ctx_length [batch]
+                None,
+            ),
+            out_axis_resources={
+                "generated_logits": P("dp", None, "tp"),
+                "generated_tokens": P("dp"),
+            },
+            static_argnums=4,
+        )
+
+    @staticmethod
+    def get_decode_state_sharding():
+        return {
+            "tokens_decoded": P(None, "dp"),  # [num_layers, batch]
+            "k": P(None, "dp", None, "tp", None),  # [num_layers, batch, seq_len, heads, dim_per_head]
+            "v": P(None, "dp", None, "tp", None),  # [num_layers, batch, seq_len, heads, dim_per_head]
+        }
+
+    @staticmethod
+    def get_sharding():
+        # 1. embed_in sharding
+        embed_in_sharding = frozen_dict.freeze(traverse_util.unflatten_dict({
+            ("embed", "kernel"): P("tp", None),
+        }))
+
+        # 2. layer_sharding
+        flat_stacked_layers_sharding = {
+            ('attn_norm', 'bias'): P(None, None, ),
+            ('attn_norm', 'scale'): P(None, None, ),
+            ('qkv_proj', 'bias'): P(None, None, ),
+            ('qkv_proj', 'kernel'): P(None, None, 'tp'),
+            ('output_proj', 'bias'): P(None, None, ),
+            ('output_proj', 'kernel'): P(None, 'tp', None),
+            ('ff_norm', 'bias'): P(None, None, ),
+            ('ff_norm', 'scale'): P(None, None, ),
+            ('ff_up_proj', 'bias'): P(None, None, ),
+            ('ff_up_proj', 'kernel'): P(None, None, 'tp'),
+            ('ff_down_proj', 'bias'): P(None, None, ),
+            ('ff_down_proj', 'kernel'): P(None, 'tp', None),
+        }
+        stacked_layers_sharding = frozen_dict.freeze(traverse_util.unflatten_dict(
+            flat_stacked_layers_sharding))
+
+        # 3. embed_out sharding
+        embed_out_sharding = {
+            ('norm', 'bias'): P(None),
+            ('norm', 'scale'): P(None),
+            ('embed_out', 'kernel'): P(None, "tp"),
+        }
+        embed_out_sharding = frozen_dict.freeze(traverse_util.unflatten_dict(embed_out_sharding))
+
+        # 4. Combine
+        all_sharding = frozen_dict.freeze({
+            "embed_in": embed_in_sharding,
+            "transformer": stacked_layers_sharding,
+            "embed_out": embed_out_sharding,
+        })
+        return all_sharding
 
 
 class ShardedEmbedIn(nn.Module):
@@ -289,10 +455,10 @@ class ShardedTransformerLayer(nn.Module):
 
         # ?? assert x.shape[0] == 1
 
-        # add new kv to end
-        v = jnp.concatenate((decode_state["v"], v), axis=1)[1:]
+        # add new kv to end, clip off the start
+        v = jnp.concatenate((decode_state["v"], v), axis=1)[:, 1:]
         # -> [batch, kv_len+1, heads, dims_per_head]
-        k = jnp.concatenate((decode_state["k"], k), axis=1)[1:]
+        k = jnp.concatenate((decode_state["k"], k), axis=1)[:, 1:]
         # -> [batch, kv_len+1, heads, dims_per_head]
 
         tokens_decoded = decode_state["tokens_decoded"] + 1
@@ -304,7 +470,7 @@ class ShardedTransformerLayer(nn.Module):
         attention_mask = (jnp.arange(0, length)[None, :] < masked_tokens)[:, None, :]
         # -> [batch, q_len=1, seq_len]
 
-        bias = (-1e10 * attention_mask)
+        bias = (-1e4 * attention_mask)
         # -> [batch, q_len=1, seq_len]
 
         attn_out = self.compute_self_attn(q, v, k, bias[:, None, :, :])
@@ -337,14 +503,14 @@ class ShardedTransformerLayer(nn.Module):
         causal_mask = np.tril(np.ones((full_length, full_length)))
         # -> [seq_len, seq_len]
 
-        bias = -1e10 * (1. - causal_mask)  # regular AR masking
+        bias = -1e4 * (1. - causal_mask)  # regular AR masking
         bias = jnp.repeat(bias[None, :], repeats=batch_size, axis=0)
         # -> [batch, seq_len, seq_len]
 
         context_length_mask = (jnp.arange(0, full_length)[None, :] < masked_tokens)[:, None, :]
         # -> [batch, 1, seq_len]
 
-        bias -= 1e10 * context_length_mask  # mask out zero tokens before context starts
+        bias -= 1e4 * context_length_mask  # mask out zero tokens before context starts
         # -> [batch, seq_len, seq_len]
 
         attn_out = self.compute_self_attn(q, v, k, bias[:, None, :, :])

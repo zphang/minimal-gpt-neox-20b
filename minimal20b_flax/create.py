@@ -48,7 +48,7 @@ def load_model_weights(checkpoint_path):
         )))
         pbar.update(1)
     # 2.1. Shard to device
-    sharding = get_sharding()
+    sharding = model.ShardedTransformer.get_sharding()
     flat_stacked_layers_sharding = traverse_util.flatten_dict(frozen_dict.unfreeze(
         sharding["transformer"]))
     pbar.set_description(f"Sharding transformer layers to TPUs")
@@ -110,47 +110,6 @@ def load_model_weights(checkpoint_path):
         "embed_out": embed_out_params
     })
     return all_params
-
-
-def get_sharding():
-    # 1. embed_in sharding
-    embed_in_sharding = frozen_dict.freeze(traverse_util.unflatten_dict({
-        ("embed", "kernel"): P("tp", None),
-    }))
-
-    # 2. layer_sharding
-    flat_stacked_layers_sharding = {
-        ('attn_norm', 'bias'): P(None, None, ),
-        ('attn_norm', 'scale'): P(None, None, ),
-        ('qkv_proj', 'bias'): P(None, None, ),
-        ('qkv_proj', 'kernel'): P(None, None, 'tp'),
-        ('output_proj', 'bias'): P(None, None, ),
-        ('output_proj', 'kernel'): P(None, 'tp', None),
-        ('ff_norm', 'bias'): P(None, None, ),
-        ('ff_norm', 'scale'): P(None, None, ),
-        ('ff_up_proj', 'bias'): P(None, None, ),
-        ('ff_up_proj', 'kernel'): P(None, None, 'tp'),
-        ('ff_down_proj', 'bias'): P(None, None, ),
-        ('ff_down_proj', 'kernel'): P(None, 'tp', None),
-    }
-    stacked_layers_sharding = frozen_dict.freeze(traverse_util.unflatten_dict(
-        flat_stacked_layers_sharding))
-
-    # 3. embed_out sharding
-    embed_out_sharding = {
-        ('norm', 'bias'): P(None),
-        ('norm', 'scale'): P(None),
-        ('embed_out', 'kernel'): P(None, "tp"),
-    }
-    embed_out_sharding = frozen_dict.freeze(traverse_util.unflatten_dict(embed_out_sharding))
-
-    # 4. Combine
-    all_sharding = frozen_dict.freeze({
-        "embed_in": embed_in_sharding,
-        "transformer": stacked_layers_sharding,
-        "embed_out": embed_out_sharding,
-    })
-    return all_sharding
 
 
 def load_single_layer_params(checkpoint_path, layer_i):
