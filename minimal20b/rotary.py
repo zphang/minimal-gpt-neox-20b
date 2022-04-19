@@ -7,16 +7,15 @@ class RotaryEmbedding(torch.nn.Module):
         super().__init__()
         inv_freq = 1. / (base ** (torch.arange(0, dim, 2).float().to(device) / dim))
         self.register_buffer('inv_freq', inv_freq)
-        self.max_seq_len_cached = None
+        # Delay initialization until first forward call, because initial model on the 'meta' device
         self.cos_cached = None
         self.sin_cached = None
 
     def forward(self, x, seq_dim=1, seq_len=None):
         if seq_len is None:
             seq_len = x.shape[seq_dim]
-        if self.max_seq_len_cached is None or (seq_len > self.max_seq_len_cached):
-            self.max_seq_len_cached = seq_len
-            t = torch.arange(self.max_seq_len_cached, device=x.device, dtype=self.inv_freq.dtype)
+        if self.cos_cached is None:
+            t = torch.arange(2048, device=x.device, dtype=self.inv_freq.dtype)
             freqs = torch.einsum('i,j->ij', t, self.inv_freq)
             # Different from paper, but it uses a different permutation in order to obtain the same calculation
             emb = torch.cat((freqs, freqs), dim=-1).to(x.device)
