@@ -30,7 +30,7 @@ neox20b_config = NeoX20BConfig()
 
 
 @struct.dataclass
-class ShardedTransformer:
+class GPTNeoX20BModel:
 
     config: NeoX20BConfig
 
@@ -336,7 +336,7 @@ class ShardedTransformerLayer(nn.Module):
         causal_mask = np.tril(np.ones((seq_len, seq_len)))[None, :, :]  # NumPy array gets cached
         # -> [1, seq_len, seq_len]
 
-        bias = -1e10 * (1. - causal_mask)
+        bias = -1e4 * (1. - causal_mask)
         bias += attn_bias
         # -> [1, seq_len, seq_len]
 

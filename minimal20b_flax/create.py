@@ -48,7 +48,7 @@ def load_model_weights(checkpoint_path):
         )))
         pbar.update(1)
     # 2.1. Shard to device
-    sharding = model.ShardedTransformer.get_sharding()
+    sharding = model.GPTNeoX20BModel.get_sharding()
     flat_stacked_layers_sharding = traverse_util.flatten_dict(frozen_dict.unfreeze(
         sharding["transformer"]))
     pbar.set_description(f"Sharding transformer layers to TPUs")
