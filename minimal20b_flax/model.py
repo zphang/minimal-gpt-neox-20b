@@ -26,13 +26,13 @@ class NeoX20BConfig:
     tp_num: int = 8
 
 
-neox20b_config = NeoX20BConfig()
+default_neox20b_config = NeoX20BConfig()
 
 
 @struct.dataclass
 class GPTNeoX20BModel:
 
-    config: NeoX20BConfig
+    config: NeoX20BConfig = default_neox20b_config
 
     def _eval_apply_fn(self, params, x, mask):
         embedded = ShardedEmbedIn(config=self.config).apply({"params": params["embed_in"]}, x)
@@ -157,7 +157,7 @@ class GPTNeoX20BModel:
         )
 
     def _generate(self, params, ctx, ctx_length, rng, generate_length):
-        init_out = self.get_initial_decode_state(
+        init_out = self._get_initial_decode_state(
             params=params,
             ctx=ctx,
             ctx_length=ctx_length
@@ -171,7 +171,7 @@ class GPTNeoX20BModel:
         }
 
         def _decode_once_scan_fn(decode_carry, rng):
-            decode_out = self.decode_once(
+            decode_out = self._decode_once(
                 params=params,
                 single_x=decode_carry["single_x"],
                 decode_state=decode_carry["decode_state"],
@@ -246,7 +246,7 @@ class GPTNeoX20BModel:
             ('ff_norm', 'scale'): P(None, None, ),
             ('ff_up_proj', 'bias'): P(None, None, ),
             ('ff_up_proj', 'kernel'): P(None, None, 'tp'),
-            ('ff_down_proj', 'bias'): P(None, None, ),
+            ('ff_down_proj', 'bias'): P(None, None),
             ('ff_down_proj', 'kernel'): P(None, 'tp', None),
         }
         stacked_layers_sharding = frozen_dict.freeze(traverse_util.unflatten_dict(
@@ -271,7 +271,7 @@ class GPTNeoX20BModel:
 
 class ShardedEmbedIn(nn.Module):
 
-    config: NeoX20BConfig
+    config: NeoX20BConfig = default_neox20b_config
 
     @nn.compact
     def __call__(self, input_ids):
@@ -292,7 +292,7 @@ class ShardedTransformerLayer(nn.Module):
     Note: This doesn't compute the full residual connection x + r(x), only r(x).
           The residual connection will be computed downstream.
     """
-    config: NeoX20BConfig
+    config: NeoX20BConfig = default_neox20b_config
 
     # noinspection PyAttributeOutsideInit
     def setup(self):
@@ -326,6 +326,16 @@ class ShardedTransformerLayer(nn.Module):
         :param attn_bias: [*, seq_len, seq_len]
         :return: [batch, seq_len, hidden_size]
         """
+        # attn_in = self.attn_norm(x)
+        # q, k, v = self.compute_qkv(attn_in)
+        # seq_len = attn_in.shape[1]
+        # causal_mask = np.tril(np.ones((seq_len, seq_len)))[None, :, :]  # NumPy array gets cached
+        # bias = -1e4 * (1. - causal_mask)
+        # bias += attn_bias
+        # return (q, k, v), self.compute_self_attn(q, k, v, bias)
+        #
+        #
+        # # ===
         attn_in = self.attn_norm(x)
         # -> [batch, seq_len, hidden_size]
 
@@ -394,6 +404,7 @@ class ShardedTransformerLayer(nn.Module):
         q_pass = q[:, :, :, rotary_dims:]
 
         sincos = fixed_pos_embedding(k_rot, seq_dim=1)
+        # return sincos
         q_rot = apply_rotary_pos_emb(q_rot, sincos)
         k_rot = apply_rotary_pos_emb(k_rot, sincos)
         q_rot = shard_to(q_rot, P("dp", None, "tp", None))
@@ -528,7 +539,7 @@ class ShardedTransformerLayer(nn.Module):
 
 class ShardedEmbedOut(nn.Module):
 
-    config: NeoX20BConfig
+    config: NeoX20BConfig = default_neox20b_config
 
     # noinspection PyAttributeOutsideInit
     def setup(self):
@@ -564,19 +575,18 @@ class ShardedEmbedOut(nn.Module):
 
 def fixed_pos_embedding(x, seq_dim=0):
     dim = x.shape[-1]
-    inv_freq = 1. / (10000 ** (np.arange(0, dim, 2) / dim))
-    sinusoid_inp = np.einsum('i , j -> i j', np.arange(x.shape[seq_dim]), inv_freq)
+    inv_freq = 1. / (10000 ** (np.arange(0, dim, 2) / dim)) .astype(np.float16)
+    sinusoid_inp = np.einsum('i , j -> i j', np.arange(x.shape[seq_dim]), inv_freq) .astype(np.float16)
     return np.sin(sinusoid_inp).astype(np.float16), np.cos(sinusoid_inp).astype(np.float16)
 
 
 def apply_rotary_pos_emb(x, sincos):
-    sin, cos = map(lambda t: repeat(t, '... b n -> ... b (n j)', j=2)[-x.shape[-3]:, None, :], sincos)
-    return (x * cos) + (rotate_every_two(x) * sin)
+    sin, cos = map(lambda t: repeat(t, '... b n -> ... b (j n)', j=2)[-x.shape[-3]:, None, :], sincos)
+    return (x * cos) + (rotate_half(x) * sin)
 
 
-def rotate_every_two(x):
+def rotate_half(x):
     half_dim = x.shape[-1] // 2
     x1 = x[:, :, :, :half_dim]
     x2 = x[:, :, :, half_dim:]
-    x = jnp.stack((-x2, x1), axis=-1)
-    return rearrange(x, '... d j -> ... (d j)')
+    return jnp.concatenate((-x2, x1), axis=-1)

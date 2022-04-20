@@ -15,9 +15,8 @@ import minimal20b_flax.utils as utils
 import minimal20b_flax.model as model
 
 
-def load_model_weights(checkpoint_path):
+def load_model_weights(checkpoint_path, config: model.NeoX20BConfig = model.default_neox20b_config):
     """Loads the weights from a checkpoint and shard to 8 TPU devices."""
-    config = model.NeoX20BConfig()
     pbar = tqdm_lib.tqdm(total=47)
 
     # 1. Load embed_in
