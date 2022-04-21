@@ -156,7 +156,7 @@ class GPTNeoX20BModel:
             }
         )
 
-    def _generate(self, params, ctx, ctx_length, rng, generate_length):
+    def _generate(self, params, ctx, ctx_length, rng, generate_length, sampler_args):
         init_out = self._get_initial_decode_state(
             params=params,
             ctx=ctx,
@@ -178,7 +178,12 @@ class GPTNeoX20BModel:
             )
 
             # Add sampling logic here
-            next_token = decode_out["logits"].argmax(-1)
+            # next_token = decode_out["logits"].argmax(-1)
+            next_token = temperature_sample(
+                key=rng,
+                logits=decode_out["logits"],
+                **sampler_args,
+            )
 
             next_carry = {
                 "single_x": next_token,
@@ -216,7 +221,7 @@ class GPTNeoX20BModel:
                 "generated_logits": P("dp", None, "tp"),
                 "generated_tokens": P("dp"),
             },
-            static_argnums=4,
+            static_argnums=(4, 5),
         )
 
     @staticmethod
@@ -590,3 +595,7 @@ def rotate_half(x):
     x1 = x[:, :, :, :half_dim]
     x2 = x[:, :, :, half_dim:]
     return jnp.concatenate((-x2, x1), axis=-1)
+
+
+def temperature_sample(key, logits, temp=1):
+    return jax.random.categorical(key, logits/temp, -1).astype(jnp.int32)
