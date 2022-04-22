@@ -1,0 +1,3 @@
+tokenizers==0.12.0
+tqdm
+flax==0.4.0
