@@ -1,5 +1,5 @@
 import numpy as np
-from einops import rearrange, repeat
+from einops import repeat
 
 import jax
 import jax.numpy as jnp
@@ -170,7 +170,7 @@ class GPTNeoX20BModel:
             "decode_state": init_out["decode_state"],
         }
 
-        def _decode_once_scan_fn(decode_carry, rng):
+        def _decode_once_scan_fn(decode_carry, step_rng):
             decode_out = self._decode_once(
                 params=params,
                 single_x=decode_carry["single_x"],
@@ -180,7 +180,7 @@ class GPTNeoX20BModel:
             # Add sampling logic here
             # next_token = decode_out["logits"].argmax(-1)
             next_token = temperature_sample(
-                key=rng,
+                key=step_rng,
                 logits=decode_out["logits"],
                 **sampler_args,
             )
@@ -331,16 +331,6 @@ class ShardedTransformerLayer(nn.Module):
         :param attn_bias: [*, seq_len, seq_len]
         :return: [batch, seq_len, hidden_size]
         """
-        # attn_in = self.attn_norm(x)
-        # q, k, v = self.compute_qkv(attn_in)
-        # seq_len = attn_in.shape[1]
-        # causal_mask = np.tril(np.ones((seq_len, seq_len)))[None, :, :]  # NumPy array gets cached
-        # bias = -1e4 * (1. - causal_mask)
-        # bias += attn_bias
-        # return (q, k, v), self.compute_self_attn(q, k, v, bias)
-        #
-        #
-        # # ===
         attn_in = self.attn_norm(x)
         # -> [batch, seq_len, hidden_size]
 
