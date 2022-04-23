@@ -187,7 +187,7 @@ def create_tokenizer(tokenizer_path):
 
 def colab_load_model_weights(checkpoint_path, config: model.NeoX20BConfig = model.default_neox20b_config):
     """Loads the weights from a checkpoint and shard to 8 TPU devices."""
-    pbar = tqdm_lib.tqdm(total=47)
+    pbar = tqdm_lib.tqdm(total=311)
 
     # 1. Load embed_in
     pbar.set_description("Loading embed_in")
@@ -213,18 +213,21 @@ def colab_load_model_weights(checkpoint_path, config: model.NeoX20BConfig = mode
     # 2.1 First pass: Load ff_up kernel
     devices = jax.local_devices()
     devices1, devices2 = devices[:4], devices[4:]
-    layer_params_list = []
+    shard_1_arr = np.empty((44, 6144, 12288), dtype=np.float16)
     for i in range(config.num_layers):
         pbar.set_description(f"Loading layer {i} (ff_up kernel) shard 1/2")
-        layer_params_list.append(colab_load_single_layer_ff_up_kernel_params(checkpoint_path, i, original_shard=0))
+        shard_1_arr[i] = colab_load_single_layer_ff_up_kernel_params(checkpoint_path, i, original_shard=0)
         pbar.update(1)
-    buffers1 = utils.split_to_device_buffers(np.stack(layer_params_list, axis=0), axis=2, devices=devices1)
+    buffers1 = utils.split_to_device_buffers(shard_1_arr, axis=2, devices=devices1)
+    del shard_1_arr
+    shard_2_arr = np.empty((44, 6144, 12288), dtype=np.float16)
     layer_params_list = []
     for i in range(config.num_layers):
         pbar.set_description(f"Loading layer {i} (ff_up kernel) shard 2/2")
-        layer_params_list.append(colab_load_single_layer_ff_up_kernel_params(checkpoint_path, i, original_shard=1))
+        shard_2_arr[i] = colab_load_single_layer_ff_up_kernel_params(checkpoint_path, i, original_shard=1)
         pbar.update(1)
-    buffers2 = utils.split_to_device_buffers(np.stack(layer_params_list, axis=0), axis=2, devices=devices2)
+    buffers2 = utils.split_to_device_buffers(shard_2_arr, axis=2, devices=devices2)
+    del shard_2_arr
     stacked_layer_params[("ff_up_proj", "kernel")] = utils.wrap_device_buffers_in_sharded_device_array(
         device_buffers=buffers1 + buffers2,
         array_shape=(44, 6144, 24576),
@@ -233,18 +236,20 @@ def colab_load_model_weights(checkpoint_path, config: model.NeoX20BConfig = mode
     )
 
     # 2.2 Second pass: Load ff_down kernel
-    layer_params_list = []
+    shard_1_arr = np.empty((44, 12288, 6144), dtype=np.float16)
     for i in range(config.num_layers):
         pbar.set_description(f"Loading layer {i} (ff_down kernel) shard 1/2")
-        layer_params_list.append(colab_load_single_layer_ff_down_kernel_params(checkpoint_path, i, original_shard=0))
+        shard_1_arr[i] = colab_load_single_layer_ff_down_kernel_params(checkpoint_path, i, original_shard=0)
         pbar.update(1)
-    buffers1 = utils.split_to_device_buffers(np.stack(layer_params_list, axis=0), axis=1, devices=devices1)
-    layer_params_list = []
+    buffers1 = utils.split_to_device_buffers(shard_1_arr, axis=1, devices=devices1)
+    del shard_1_arr
+    shard_2_arr = np.empty((44, 12288, 6144), dtype=np.float16)
     for i in range(config.num_layers):
         pbar.set_description(f"Loading layer {i} (ff_down kernel) shard 2/2")
-        layer_params_list.append(colab_load_single_layer_ff_down_kernel_params(checkpoint_path, i, original_shard=1))
+        shard_2_arr[i] = colab_load_single_layer_ff_down_kernel_params(checkpoint_path, i, original_shard=1)
         pbar.update(1)
-    buffers2 = utils.split_to_device_buffers(np.stack(layer_params_list, axis=0), axis=1, devices=devices2)
+    buffers2 = utils.split_to_device_buffers(shard_2_arr, axis=1, devices=devices2)
+    del shard_2_arr
     stacked_layer_params[("ff_down_proj", "kernel")] = utils.wrap_device_buffers_in_sharded_device_array(
         device_buffers=buffers1 + buffers2,
         array_shape=(44, 24576, 6144),
@@ -253,18 +258,20 @@ def colab_load_model_weights(checkpoint_path, config: model.NeoX20BConfig = mode
     )
 
     # 2.3 Third pass: Load qkv kernel
-    layer_params_list = []
+    shard_1_arr = np.empty((44, 6144, 9216), dtype=np.float16)
     for i in range(config.num_layers):
         pbar.set_description(f"Loading layer {i} (qkv kernel) shard 1/2")
-        layer_params_list.append(colab_load_single_layer_qkv_kernel_params(checkpoint_path, i, original_shard=0))
+        shard_1_arr[i] = colab_load_single_layer_qkv_kernel_params(checkpoint_path, i, original_shard=0)
         pbar.update(1)
-    buffers1 = utils.split_to_device_buffers(np.stack(layer_params_list, axis=0), axis=2, devices=devices1)
-    layer_params_list = []
+    buffers1 = utils.split_to_device_buffers(shard_1_arr, axis=2, devices=devices1)
+    del shard_1_arr
+    shard_2_arr = np.empty((44, 6144, 9216), dtype=np.float16)
     for i in range(config.num_layers):
         pbar.set_description(f"Loading layer {i} (qkv kernel) shard 2/2")
-        layer_params_list.append(colab_load_single_layer_qkv_kernel_params(checkpoint_path, i, original_shard=1))
+        shard_2_arr[i] = colab_load_single_layer_qkv_kernel_params(checkpoint_path, i, original_shard=1)
         pbar.update(1)
-    buffers2 = utils.split_to_device_buffers(np.stack(layer_params_list, axis=0), axis=2, devices=devices2)
+    buffers2 = utils.split_to_device_buffers(shard_2_arr, axis=2, devices=devices2)
+    del shard_2_arr
     stacked_layer_params[("qkv_proj", "kernel")] = utils.wrap_device_buffers_in_sharded_device_array(
         device_buffers=buffers1 + buffers2,
         array_shape=(44, 6144, 18432),
