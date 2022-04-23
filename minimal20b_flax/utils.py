@@ -1,6 +1,7 @@
 import numpy as np
 import jax.interpreters.pxla
 import jax.numpy as jnp
+from jax.experimental import maps
 
 
 def replicate_to_devices(array, devices=None):
@@ -84,3 +85,35 @@ def wrap_device_buffers_in_sharded_device_array(device_buffers, array_shape, axi
         sharding_spec=sharding_spec,
         device_buffers=device_buffers,
     )
+
+
+def jnp_sharded_zeros(array_shape, axis, devices=None):
+    if devices is None:
+        devices = jax.local_devices()
+    num_devices = len(devices)
+    buffer_shape = list(array_shape.shape)
+    buffer_shape[axis] //= num_devices
+    device_buffers = [
+        jax.device_put(jnp.zeros(...), device)
+        for device in devices
+    ]
+    num_dims = len(array_shape)
+    sharding = [jax.interpreters.pxla.NoSharding() for _ in range(num_dims)]
+    sharding[axis] = jax.interpreters.pxla.Chunked((num_devices,))
+    sharding = tuple(sharding)
+    mesh_mapping = (
+        jax.interpreters.pxla.Replicated(1),
+        jax.interpreters.pxla.ShardedAxis(0),
+    )
+    sharding_spec = jax.interpreters.pxla.ShardingSpec(sharding, mesh_mapping)
+    return jax.interpreters.pxla.make_sharded_device_array(
+        aval=jax.ShapedArray(array_shape, jnp.float16),
+        sharding_spec=sharding_spec,
+        device_buffers=device_buffers,
+    )
+
+
+def get_default_mesh():
+    devices = jax.local_devices()
+    return maps.Mesh(np.asarray(devices).reshape(1, 8), ('dp', 'tp'))
+

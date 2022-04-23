@@ -7,6 +7,9 @@ import numpy as np
 
 # noinspection PyPep8Naming
 from jax.experimental import PartitionSpec as P
+from jax.experimental.pjit import pjit
+from jax.experimental import maps
+import jax.numpy as jnp
 from flax.core import frozen_dict
 from flax import traverse_util
 
@@ -210,105 +213,69 @@ def colab_load_model_weights(checkpoint_path, config: model.NeoX20BConfig = mode
     flat_stacked_layers_sharding = traverse_util.flatten_dict(frozen_dict.unfreeze(
         sharding["transformer"]))
 
-    # 2.1 First pass: Load ff_up kernel
-    devices = jax.local_devices()
-    devices1, devices2 = devices[:4], devices[4:]
-    shard_1_arr = np.empty((44, 6144, 12288), dtype=np.float16)
-    for i in range(config.num_layers):
-        pbar.set_description(f"Loading layer {i} (ff_up kernel) shard 1/2")
-        shard_1_arr[i] = colab_load_single_layer_ff_up_kernel_params(checkpoint_path, i, original_shard=0)
-        pbar.update(1)
-    buffers1 = utils.split_to_device_buffers(shard_1_arr, axis=2, devices=devices1)
-    del shard_1_arr
-    shard_2_arr = np.empty((44, 6144, 12288), dtype=np.float16)
-    layer_params_list = []
-    for i in range(config.num_layers):
-        pbar.set_description(f"Loading layer {i} (ff_up kernel) shard 2/2")
-        shard_2_arr[i] = colab_load_single_layer_ff_up_kernel_params(checkpoint_path, i, original_shard=1)
-        pbar.update(1)
-    buffers2 = utils.split_to_device_buffers(shard_2_arr, axis=2, devices=devices2)
-    del shard_2_arr
-    stacked_layer_params[("ff_up_proj", "kernel")] = utils.wrap_device_buffers_in_sharded_device_array(
-        device_buffers=buffers1 + buffers2,
-        array_shape=(44, 6144, 24576),
-        axis=2,
-        devices=None,
+    # 2.1 Preallocate
+    def initialize_layer_params():
+        shape_dict = {
+            ('attn_norm', 'scale'): (44, 6144,),
+            ('attn_norm', 'bias'): (44, 6144,),
+            ('qkv_proj', 'kernel'): (44, 6144, 18432),
+            ('qkv_proj', 'bias'): (44, 18432,),
+            ('output_proj', 'kernel'): (44, 6144, 6144),
+            ('output_proj', 'bias'): (44, 6144,),
+            ('ff_norm', 'scale'): (44, 6144,),
+            ('ff_norm', 'bias'): (44, 6144,),
+            ('ff_up_proj', 'kernel'): (44, 6144, 24576),
+            ('ff_up_proj', 'bias'): (44, 24576,),
+            ('ff_down_proj', 'kernel'): (44, 24576, 6144),
+            ('ff_down_proj', 'bias'): (44, 6144,),
+        }
+        layer_params = {}
+        for k, v in shape_dict.items():
+            layer_params[k] = jnp.zeros(v, dtype=jnp.float16)
+        return layer_params
+
+    initialize_layer_params_pjit = pjit(
+        initialize_layer_params,
+        in_axis_resources=None,
+        out_axis_resources=flat_stacked_layers_sharding,
     )
+    mesh = utils.get_default_mesh()
+    with maps.mesh(mesh.devices, mesh.axis_names):
+        pbar.set_description(f"Initializing layer params on device")
+        stacked_layer_params = initialize_layer_params_pjit()
+        pbar.update(1)
 
-    # 2.2 Second pass: Load ff_down kernel
-    shard_1_arr = np.empty((44, 12288, 6144), dtype=np.float16)
-    for i in range(config.num_layers):
-        pbar.set_description(f"Loading layer {i} (ff_down kernel) shard 1/2")
-        shard_1_arr[i] = colab_load_single_layer_ff_down_kernel_params(checkpoint_path, i, original_shard=0)
-        pbar.update(1)
-    buffers1 = utils.split_to_device_buffers(shard_1_arr, axis=1, devices=devices1)
-    del shard_1_arr
-    shard_2_arr = np.empty((44, 12288, 6144), dtype=np.float16)
-    for i in range(config.num_layers):
-        pbar.set_description(f"Loading layer {i} (ff_down kernel) shard 2/2")
-        shard_2_arr[i] = colab_load_single_layer_ff_down_kernel_params(checkpoint_path, i, original_shard=1)
-        pbar.update(1)
-    buffers2 = utils.split_to_device_buffers(shard_2_arr, axis=1, devices=devices2)
-    del shard_2_arr
-    stacked_layer_params[("ff_down_proj", "kernel")] = utils.wrap_device_buffers_in_sharded_device_array(
-        device_buffers=buffers1 + buffers2,
-        array_shape=(44, 24576, 6144),
-        axis=1,
-        devices=None,
-    )
+    def assign_to_sharded_device_array(old_state, new_layer, layer_idx):
+        new_state = old_state.at[layer_idx].set(new_layer)
+        return new_state
 
-    # 2.3 Third pass: Load qkv kernel
-    shard_1_arr = np.empty((44, 6144, 9216), dtype=np.float16)
-    for i in range(config.num_layers):
-        pbar.set_description(f"Loading layer {i} (qkv kernel) shard 1/2")
-        shard_1_arr[i] = colab_load_single_layer_qkv_kernel_params(checkpoint_path, i, original_shard=0)
-        pbar.update(1)
-    buffers1 = utils.split_to_device_buffers(shard_1_arr, axis=2, devices=devices1)
-    del shard_1_arr
-    shard_2_arr = np.empty((44, 6144, 9216), dtype=np.float16)
-    for i in range(config.num_layers):
-        pbar.set_description(f"Loading layer {i} (qkv kernel) shard 2/2")
-        shard_2_arr[i] = colab_load_single_layer_qkv_kernel_params(checkpoint_path, i, original_shard=1)
-        pbar.update(1)
-    buffers2 = utils.split_to_device_buffers(shard_2_arr, axis=2, devices=devices2)
-    del shard_2_arr
-    stacked_layer_params[("qkv_proj", "kernel")] = utils.wrap_device_buffers_in_sharded_device_array(
-        device_buffers=buffers1 + buffers2,
-        array_shape=(44, 6144, 18432),
-        axis=2,
-        devices=None,
-    )
+    assign_funcs_dict = {}
+    for k in stacked_layer_params:
+        assign_funcs_dict[k] = pjit(
+            assign_to_sharded_device_array,
+            in_axis_resources=(
+                flat_stacked_layers_sharding[k],
+                P(*flat_stacked_layers_sharding[k][1:]),
+            ),
+            out_axis_resources=flat_stacked_layers_sharding[k],
+            donate_argnums=(0,),
+            static_argnums=(2,),
+        )
 
-    # 2.4 Fourth pass: Load remaining layer weights
-    layer_params_list = []
-    for i in range(config.num_layers):
-        pbar.set_description(f"Loading layer {i}")
-        layer_params_list.append(traverse_util.flatten_dict(frozen_dict.unfreeze(
-            colab_load_single_layer_params(checkpoint_path, i)
-        )))
-        pbar.update(1)
-    # 2.4.1 Shard to device
-    pbar.set_description(f"Sharding transformer layers to TPUs")
-    for k, v in layer_params_list[0].items():
-        stacked = np.stack([
-            layer_params[k]
-            for layer_params in layer_params_list
-        ], axis=0)
-        shard_strategy = flat_stacked_layers_sharding[k]
-        if shard_strategy == P(None, None):
-            stacked = utils.replicate_to_devices(stacked)
-        elif shard_strategy == P(None, None, "tp"):
-            stacked = utils.shard_to_devices(stacked, axis=2)
-        elif shard_strategy == P(None, "tp", None):
-            stacked = utils.shard_to_devices(stacked, axis=1)
-        else:
-            raise RuntimeError()
-        stacked_layer_params[k] = stacked
+    for layer_i in range(config.num_layers):
+        pbar.set_description(f"Loading layer {layer_i}")
+        single_layer_params = load_single_layer_params(checkpoint_path, layer_i)
+        flattened_layer_params = traverse_util.flatten_dict(frozen_dict.unfreeze(single_layer_params))
+        with maps.mesh(mesh.devices, mesh.axis_names):
+            for k in stacked_layer_params:
+                stacked_layer_params[k] = assign_funcs_dict[k](
+                    stacked_layer_params[k],
+                    flattened_layer_params[k],
+                    layer_i,
+                )
+                pbar.update(1)
 
-    stacked_layer_params = frozen_dict.freeze(traverse_util.unflatten_dict(
-        stacked_layer_params
-    ))
-    pbar.update(1)
+    stacked_layer_params = frozen_dict.freeze(traverse_util.unflatten_dict(stacked_layer_params))
 
     # 3. Load final layer norm and embed_out (jointly "embed_out")
     pbar.set_description(f"Load embed_out")
