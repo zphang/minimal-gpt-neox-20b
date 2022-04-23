@@ -1,4 +1,6 @@
 import os
+
+import jax
 from tqdm import auto as tqdm_lib
 
 import numpy as np
@@ -79,25 +81,25 @@ def load_model_weights(checkpoint_path, config: model.NeoX20BConfig = model.defa
     # noinspection PyDictCreation
     embed_out_params = {
         ("norm", "bias"): (loaded_tp1["norm.bias"] + loaded_tp2["norm.bias"]) / 2,
-        ('norm', 'scale'): (loaded_tp1["norm.weight"] + loaded_tp2["norm.weight"]) / 2,
+        ("norm", "scale"): (loaded_tp1["norm.weight"] + loaded_tp2["norm.weight"]) / 2,
     }
     del loaded_tp1
     del loaded_tp2
     loaded_tp1 = load_to_numpy(os.path.join(checkpoint_path, "layer_48-model_00-model_states.pt"))
     loaded_tp2 = load_to_numpy(os.path.join(checkpoint_path, "layer_48-model_01-model_states.pt"))
-    embed_out_params['embed_out', 'kernel'] = np.concatenate([
+    embed_out_params["embed_out", "kernel"] = np.concatenate([
         loaded_tp1["final_linear.weight"].T,
         loaded_tp2["final_linear.weight"].T,
     ], axis=1)
     del loaded_tp1
     del loaded_tp2
     # 3.1. Shard to device
-    embed_out_params['norm', 'bias'] = utils.replicate_to_devices(
-        embed_out_params['norm', 'bias'])
-    embed_out_params['norm', 'scale'] = utils.replicate_to_devices(
-        embed_out_params['norm', 'scale'])
-    embed_out_params['embed_out', 'kernel'] = utils.shard_to_devices(
-        embed_out_params['embed_out', 'kernel'], axis=1)
+    embed_out_params["norm", "bias"] = utils.replicate_to_devices(
+        embed_out_params["norm", "bias"])
+    embed_out_params["norm", "scale"] = utils.replicate_to_devices(
+        embed_out_params["norm", "scale"])
+    embed_out_params["embed_out", "kernel"] = utils.shard_to_devices(
+        embed_out_params["embed_out", "kernel"], axis=1)
     embed_out_params = frozen_dict.freeze(traverse_util.unflatten_dict(embed_out_params))
     pbar.update(1)
     pbar.set_description("Done.")
@@ -118,52 +120,52 @@ def load_single_layer_params(checkpoint_path, layer_i):
     loaded_tp2 = load_to_numpy(os.path.join(checkpoint_path, filename_tp2))
     # noinspection PyDictCreation
     layer_params = {}
-    layer_params['attn_norm', 'bias'] = (
+    layer_params["attn_norm", "bias"] = (
         loaded_tp1["input_layernorm.bias"]
         + loaded_tp2["input_layernorm.bias"]
     ) / 2
-    layer_params['attn_norm', 'scale'] = (
+    layer_params["attn_norm", "scale"] = (
         loaded_tp1["input_layernorm.weight"]
         + loaded_tp2["input_layernorm.weight"]
     ) / 2
-    layer_params['qkv_proj', 'kernel'] = np.concatenate([
+    layer_params["qkv_proj", "kernel"] = np.concatenate([
         loaded_tp1["attention.query_key_value.weight"].T,
         loaded_tp2["attention.query_key_value.weight"].T,
     ], axis=1).reshape((6144, 8, 8, 3, 96)).swapaxes(2, 3).reshape((6144, 18432))
     # input_dim, num_heads1(tp), numheads2(heads per device), qkv, dim_per_head
-    layer_params['qkv_proj', 'bias'] = np.concatenate([
+    layer_params["qkv_proj", "bias"] = np.concatenate([
         loaded_tp1["attention.query_key_value.bias"],
         loaded_tp2["attention.query_key_value.bias"],
     ]).reshape((8, 8, 3, 96)).swapaxes(1, 2).reshape(18432)
-    layer_params['output_proj', 'kernel'] = np.concatenate([
+    layer_params["output_proj", "kernel"] = np.concatenate([
         loaded_tp1["attention.dense.weight"].T,
         loaded_tp2["attention.dense.weight"].T,
     ], axis=0)
-    layer_params['output_proj', 'bias'] = (
+    layer_params["output_proj", "bias"] = (
         loaded_tp1["attention.dense.bias"]
         + loaded_tp2["attention.dense.bias"]
     )
-    layer_params['ff_norm', 'bias'] = (
+    layer_params["ff_norm", "bias"] = (
         loaded_tp1["post_attention_layernorm.bias"]
         + loaded_tp2["post_attention_layernorm.bias"]
     ) / 2
-    layer_params['ff_norm', 'scale'] = (
+    layer_params["ff_norm", "scale"] = (
         loaded_tp1["post_attention_layernorm.weight"]
         + loaded_tp2["post_attention_layernorm.weight"]
     ) / 2
-    layer_params['ff_up_proj', 'kernel'] = np.concatenate([
+    layer_params["ff_up_proj", "kernel"] = np.concatenate([
         loaded_tp1["mlp.dense_h_to_4h.weight"].T,
         loaded_tp2["mlp.dense_h_to_4h.weight"].T,
     ], axis=1)
-    layer_params['ff_up_proj', 'bias'] = np.concatenate([
+    layer_params["ff_up_proj", "bias"] = np.concatenate([
         loaded_tp1["mlp.dense_h_to_4h.bias"],
         loaded_tp2["mlp.dense_h_to_4h.bias"],
     ])
-    layer_params['ff_down_proj', 'kernel'] = np.concatenate([
+    layer_params["ff_down_proj", "kernel"] = np.concatenate([
         loaded_tp1["mlp.dense_4h_to_h.weight"].T,
         loaded_tp2["mlp.dense_4h_to_h.weight"].T,
     ], axis=0)
-    layer_params['ff_down_proj', 'bias'] = (
+    layer_params["ff_down_proj", "bias"] = (
         loaded_tp1["mlp.dense_4h_to_h.bias"]
         + loaded_tp2["mlp.dense_4h_to_h.bias"]
     )
@@ -203,42 +205,74 @@ def colab_load_model_weights(checkpoint_path, config: model.NeoX20BConfig = mode
     })
     pbar.update(1)
 
-    def _move_to_device(arr, shard_strategy_):
-        if shard_strategy == P(None, None):
-            arr = utils.replicate_to_devices(arr)
-        elif shard_strategy == P(None, None, "tp"):
-            arr = utils.shard_to_devices(arr, axis=2)
-        elif shard_strategy == P(None, "tp", None):
-            arr = utils.shard_to_devices(arr, axis=1)
-        else:
-            raise RuntimeError()
-        return arr
-
     stacked_layer_params = {}
     sharding = model.GPTNeoX20BModel.get_sharding()
     flat_stacked_layers_sharding = traverse_util.flatten_dict(frozen_dict.unfreeze(
         sharding["transformer"]))
-    # 2.2 Second pass ff_up kernel
+
+    # 2.1 First pass: Load ff_up kernel
+    devices = jax.local_devices()
+    devices1, devices2 = devices[:4], devices[4:]
     layer_params_list = []
     for i in range(config.num_layers):
-        pbar.set_description(f"Loading layer {i}")
-        layer_params_list.append(traverse_util.flatten_dict(frozen_dict.unfreeze(
-            colab_load_single_layer_ff_up_kernel_params(checkpoint_path, i)
-        )))
+        pbar.set_description(f"Loading layer {i} (ff_up kernel) shard 1/2")
+        layer_params_list.append(colab_load_single_layer_ff_up_kernel_params(checkpoint_path, i, original_shard=0))
         pbar.update(1)
-    stacked_layer_params[('ff_up_proj', 'kernel')] = _move_to_device(
-        arr=np.stack([
-            layer_params[('ff_up_proj', 'kernel')]
-            for layer_params in layer_params_list
-        ], axis=0),
-        shard_strategy_=flat_stacked_layers_sharding[('ff_up_proj', 'kernel')],
+    buffers1 = utils.split_to_device_buffers(np.stack(layer_params_list, axis=0), axis=2, devices=devices1)
+    layer_params_list = []
+    for i in range(config.num_layers):
+        pbar.set_description(f"Loading layer {i} (ff_up kernel) shard 2/2")
+        layer_params_list.append(colab_load_single_layer_ff_up_kernel_params(checkpoint_path, i, original_shard=1))
+        pbar.update(1)
+    buffers2 = utils.split_to_device_buffers(np.stack(layer_params_list, axis=0), axis=2, devices=devices2)
+    stacked_layer_params[("ff_up_proj", "kernel")] = utils.wrap_device_buffers_in_sharded_device_array(
+        device_buffers=buffers1 + buffers2,
+        array_shape=(44, 6144, 24576),
+        axis=2,
+        devices=None,
     )
-    pbar.update(1)
 
-    # 2. Load layer weights
-    #    These are stacked because we will later run a jax.lax.scan over them to iterate
-    #    over layers.
-    # Note: this next line loads all the layers into CPU memory, which is a lot.
+    # 2.2 Second pass: Load ff_down kernel
+    layer_params_list = []
+    for i in range(config.num_layers):
+        pbar.set_description(f"Loading layer {i} (ff_down kernel) shard 1/2")
+        layer_params_list.append(colab_load_single_layer_ff_down_kernel_params(checkpoint_path, i, original_shard=0))
+        pbar.update(1)
+    buffers1 = utils.split_to_device_buffers(np.stack(layer_params_list, axis=0), axis=1, devices=devices1)
+    layer_params_list = []
+    for i in range(config.num_layers):
+        pbar.set_description(f"Loading layer {i} (ff_down kernel) shard 2/2")
+        layer_params_list.append(colab_load_single_layer_ff_down_kernel_params(checkpoint_path, i, original_shard=1))
+        pbar.update(1)
+    buffers2 = utils.split_to_device_buffers(np.stack(layer_params_list, axis=0), axis=1, devices=devices2)
+    stacked_layer_params[("ff_down_proj", "kernel")] = utils.wrap_device_buffers_in_sharded_device_array(
+        device_buffers=buffers1 + buffers2,
+        array_shape=(44, 24576, 6144),
+        axis=1,
+        devices=None,
+    )
+
+    # 2.3 Third pass: Load qkv kernel
+    layer_params_list = []
+    for i in range(config.num_layers):
+        pbar.set_description(f"Loading layer {i} (qkv kernel) shard 1/2")
+        layer_params_list.append(colab_load_single_layer_qkv_kernel_params(checkpoint_path, i, original_shard=0))
+        pbar.update(1)
+    buffers1 = utils.split_to_device_buffers(np.stack(layer_params_list, axis=0), axis=2, devices=devices1)
+    layer_params_list = []
+    for i in range(config.num_layers):
+        pbar.set_description(f"Loading layer {i} (qkv kernel) shard 2/2")
+        layer_params_list.append(colab_load_single_layer_qkv_kernel_params(checkpoint_path, i, original_shard=1))
+        pbar.update(1)
+    buffers2 = utils.split_to_device_buffers(np.stack(layer_params_list, axis=0), axis=2, devices=devices2)
+    stacked_layer_params[("qkv_proj", "kernel")] = utils.wrap_device_buffers_in_sharded_device_array(
+        device_buffers=buffers1 + buffers2,
+        array_shape=(44, 6144, 18432),
+        axis=2,
+        devices=None,
+    )
+
+    # 2.4 Fourth pass: Load remaining layer weights
     layer_params_list = []
     for i in range(config.num_layers):
         pbar.set_description(f"Loading layer {i}")
@@ -246,7 +280,7 @@ def colab_load_model_weights(checkpoint_path, config: model.NeoX20BConfig = mode
             colab_load_single_layer_params(checkpoint_path, i)
         )))
         pbar.update(1)
-    # 2.1. Shard to device
+    # 2.4.1 Shard to device
     pbar.set_description(f"Sharding transformer layers to TPUs")
     for k, v in layer_params_list[0].items():
         stacked = np.stack([
@@ -254,24 +288,15 @@ def colab_load_model_weights(checkpoint_path, config: model.NeoX20BConfig = mode
             for layer_params in layer_params_list
         ], axis=0)
         shard_strategy = flat_stacked_layers_sharding[k]
-        stacked_layer_params[k] = _move_to_device(stacked, shard_strategy)
-
-    # 2.3 Third pass for ff_down kernel
-    layer_params_list = []
-    for i in range(config.num_layers):
-        pbar.set_description(f"Loading layer {i}")
-        layer_params_list.append(traverse_util.flatten_dict(frozen_dict.unfreeze(
-            colab_load_single_layer_ff_down_kernel_params(checkpoint_path, i)
-        )))
-        pbar.update(1)
-    stacked_layer_params[('ff_down_proj', 'kernel')] = _move_to_device(
-        arr=np.stack([
-            layer_params[('ff_down_proj', 'kernel')]
-            for layer_params in layer_params_list
-        ], axis=0),
-        shard_strategy_=flat_stacked_layers_sharding[('ff_down_proj', 'kernel')],
-    )
-    pbar.update(1)
+        if shard_strategy == P(None, None):
+            stacked = utils.replicate_to_devices(stacked)
+        elif shard_strategy == P(None, None, "tp"):
+            stacked = utils.shard_to_devices(stacked, axis=2)
+        elif shard_strategy == P(None, "tp", None):
+            stacked = utils.shard_to_devices(stacked, axis=1)
+        else:
+            raise RuntimeError()
+        stacked_layer_params[k] = stacked
 
     stacked_layer_params = frozen_dict.freeze(traverse_util.unflatten_dict(
         stacked_layer_params
@@ -285,25 +310,25 @@ def colab_load_model_weights(checkpoint_path, config: model.NeoX20BConfig = mode
     # noinspection PyDictCreation
     embed_out_params = {
         ("norm", "bias"): (loaded_tp1["norm.bias"] + loaded_tp2["norm.bias"]) / 2,
-        ('norm', 'scale'): (loaded_tp1["norm.weight"] + loaded_tp2["norm.weight"]) / 2,
+        ("norm", "scale"): (loaded_tp1["norm.weight"] + loaded_tp2["norm.weight"]) / 2,
     }
     del loaded_tp1
     del loaded_tp2
     loaded_tp1 = load_to_numpy(os.path.join(checkpoint_path, "layer_48-model_00-model_states.pt"))
     loaded_tp2 = load_to_numpy(os.path.join(checkpoint_path, "layer_48-model_01-model_states.pt"))
-    embed_out_params['embed_out', 'kernel'] = np.concatenate([
+    embed_out_params["embed_out", "kernel"] = np.concatenate([
         loaded_tp1["final_linear.weight"].T,
         loaded_tp2["final_linear.weight"].T,
     ], axis=1)
     del loaded_tp1
     del loaded_tp2
     # 3.1. Shard to device
-    embed_out_params['norm', 'bias'] = utils.replicate_to_devices(
-        embed_out_params['norm', 'bias'])
-    embed_out_params['norm', 'scale'] = utils.replicate_to_devices(
-        embed_out_params['norm', 'scale'])
-    embed_out_params['embed_out', 'kernel'] = utils.shard_to_devices(
-        embed_out_params['embed_out', 'kernel'], axis=1)
+    embed_out_params["norm", "bias"] = utils.replicate_to_devices(
+        embed_out_params["norm", "bias"])
+    embed_out_params["norm", "scale"] = utils.replicate_to_devices(
+        embed_out_params["norm", "scale"])
+    embed_out_params["embed_out", "kernel"] = utils.shard_to_devices(
+        embed_out_params["embed_out", "kernel"], axis=1)
     embed_out_params = frozen_dict.freeze(traverse_util.unflatten_dict(embed_out_params))
     pbar.update(1)
     pbar.set_description("Done.")
@@ -324,44 +349,44 @@ def colab_load_single_layer_params(checkpoint_path, layer_i):
     loaded_tp2 = load_to_numpy(os.path.join(checkpoint_path, filename_tp2))
     # noinspection PyDictCreation
     layer_params = {}
-    layer_params['attn_norm', 'bias'] = (
+    layer_params["attn_norm", "bias"] = (
         loaded_tp1["input_layernorm.bias"]
         + loaded_tp2["input_layernorm.bias"]
     ) / 2
-    layer_params['attn_norm', 'scale'] = (
+    layer_params["attn_norm", "scale"] = (
         loaded_tp1["input_layernorm.weight"]
         + loaded_tp2["input_layernorm.weight"]
     ) / 2
-    layer_params['qkv_proj', 'kernel'] = np.concatenate([
+    layer_params["qkv_proj", "kernel"] = np.concatenate([
         loaded_tp1["attention.query_key_value.weight"].T,
         loaded_tp2["attention.query_key_value.weight"].T,
     ], axis=1).reshape((6144, 8, 8, 3, 96)).swapaxes(2, 3).reshape((6144, 18432))
     # input_dim, num_heads1(tp), numheads2(heads per device), qkv, dim_per_head
-    layer_params['qkv_proj', 'bias'] = np.concatenate([
+    layer_params["qkv_proj", "bias"] = np.concatenate([
         loaded_tp1["attention.query_key_value.bias"],
         loaded_tp2["attention.query_key_value.bias"],
     ]).reshape((8, 8, 3, 96)).swapaxes(1, 2).reshape(18432)
-    layer_params['output_proj', 'kernel'] = np.concatenate([
+    layer_params["output_proj", "kernel"] = np.concatenate([
         loaded_tp1["attention.dense.weight"].T,
         loaded_tp2["attention.dense.weight"].T,
     ], axis=0)
-    layer_params['output_proj', 'bias'] = (
+    layer_params["output_proj", "bias"] = (
         loaded_tp1["attention.dense.bias"]
         + loaded_tp2["attention.dense.bias"]
     )
-    layer_params['ff_norm', 'bias'] = (
+    layer_params["ff_norm", "bias"] = (
         loaded_tp1["post_attention_layernorm.bias"]
         + loaded_tp2["post_attention_layernorm.bias"]
     ) / 2
-    layer_params['ff_norm', 'scale'] = (
+    layer_params["ff_norm", "scale"] = (
         loaded_tp1["post_attention_layernorm.weight"]
         + loaded_tp2["post_attention_layernorm.weight"]
     ) / 2
-    layer_params['ff_up_proj', 'bias'] = np.concatenate([
+    layer_params["ff_up_proj", "bias"] = np.concatenate([
         loaded_tp1["mlp.dense_h_to_4h.bias"],
         loaded_tp2["mlp.dense_h_to_4h.bias"],
     ])
-    layer_params['ff_down_proj', 'bias'] = (
+    layer_params["ff_down_proj", "bias"] = (
         loaded_tp1["mlp.dense_4h_to_h.bias"]
         + loaded_tp2["mlp.dense_4h_to_h.bias"]
     )
@@ -371,35 +396,21 @@ def colab_load_single_layer_params(checkpoint_path, layer_i):
     return layer_params
 
 
-def colab_load_single_layer_ff_up_kernel_params(checkpoint_path, layer_i):
-    filename_tp1 = f"layer_{layer_i + 2:02d}-model_00-model_states.pt"
-    filename_tp2 = f"layer_{layer_i + 2:02d}-model_01-model_states.pt"
-    loaded_tp1 = load_to_numpy(os.path.join(checkpoint_path, filename_tp1))
-    loaded_tp2 = load_to_numpy(os.path.join(checkpoint_path, filename_tp2))
-    layer_params = {
-        ('ff_up_proj', 'kernel'): np.concatenate([
-            loaded_tp1["mlp.dense_h_to_4h.weight"].T,
-            loaded_tp2["mlp.dense_h_to_4h.weight"].T,
-        ], axis=1)
-    }
-    layer_params = frozen_dict.freeze(traverse_util.unflatten_dict(layer_params))
-    del loaded_tp1
-    del loaded_tp2
-    return layer_params
+def colab_load_single_layer_qkv_kernel_params(checkpoint_path, layer_i, original_shard: int):
+    filename = f"layer_{layer_i + 2:02d}-model_{original_shard:02d}-model_states.pt"
+    loaded = load_to_numpy(os.path.join(checkpoint_path, filename))
+    return loaded["attention.query_key_value.weight"].T.reshape(
+        (6144, 4, 8, 3, 96)
+    ).swapaxes(2, 3).reshape((6144, 9216))
 
 
-def colab_load_single_layer_ff_down_kernel_params(checkpoint_path, layer_i):
-    filename_tp1 = f"layer_{layer_i + 2:02d}-model_00-model_states.pt"
-    filename_tp2 = f"layer_{layer_i + 2:02d}-model_01-model_states.pt"
-    loaded_tp1 = load_to_numpy(os.path.join(checkpoint_path, filename_tp1))
-    loaded_tp2 = load_to_numpy(os.path.join(checkpoint_path, filename_tp2))
-    layer_params = {
-        ('ff_down_proj', 'kernel'): np.concatenate([
-            loaded_tp1["mlp.dense_4h_to_h.weight"].T,
-            loaded_tp2["mlp.dense_4h_to_h.weight"].T,
-        ], axis=0)
-    }
-    layer_params = frozen_dict.freeze(traverse_util.unflatten_dict(layer_params))
-    del loaded_tp1
-    del loaded_tp2
-    return layer_params
+def colab_load_single_layer_ff_up_kernel_params(checkpoint_path, layer_i, original_shard: int):
+    filename = f"layer_{layer_i + 2:02d}-model_{original_shard:02d}-model_states.pt"
+    loaded = load_to_numpy(os.path.join(checkpoint_path, filename))
+    return loaded["mlp.dense_h_to_4h.weight"].T
+
+
+def colab_load_single_layer_ff_down_kernel_params(checkpoint_path, layer_i, original_shard: int):
+    filename = f"layer_{layer_i + 2:02d}-model_{original_shard:02d}-model_states.pt"
+    loaded = load_to_numpy(os.path.join(checkpoint_path, filename))
+    return loaded["mlp.dense_4h_to_h.weight"].T
