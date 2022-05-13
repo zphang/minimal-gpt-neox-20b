@@ -58,72 +58,54 @@ class GPTNeoX20BModel(nn.Module):
             new_residual, decode_state = layer.get_init_decode_state(h, ctx_length)
             decode_state_list.append(decode_state)
             h = h + new_residual
-        final_logit = self.embed_out(h)
+        final_logit = self.embed_out(h[-1:, :])
         return {"logits": final_logit, "decode_state": decode_state_list}
 
-    def decode_once(self, params, single_x, decode_state):
+    def decode_once(self, single_x, decode_state):
         assert single_x.shape[1] == 1
         # Embed single token
-        embedded = ShardedEmbedIn(config=self.config).apply(
-            {"params": params["embed_in"]}, single_x)
+        embedded = self.embed_in(single_x)
+        h = embedded
+        new_decode_state = []
+        for layer, layer_decode_state in zip(self.layers, decode_state):
+            new_residual, new_layer_decode_state = layer.decode_once(decode_state=layer_decode_state, x=h)
+            new_decode_state.append(new_layer_decode_state)
+            h = h + new_residual
 
-        # Set up scan function for doing a single decoding step for each layer
-        def _transformer_layer_decode_once_scan_fn(h, layer_params_and_decode_state):
-            layer_params, layer_decode_state = layer_params_and_decode_state
-            new_residual, new_layer_decode_state = ShardedTransformerLayer(config=self.config).apply(
-                {"params": layer_params},
-                layer_decode_state, h,
-                method=ShardedTransformerLayer.decode_once,
-            )
-            h_out = h + new_residual
-            return h_out, new_layer_decode_state
-
-        # Run scan over transformer layers
-        layers_out, new_decode_state = jax.lax.scan(
-            f=_transformer_layer_decode_once_scan_fn,
-            init=embedded,
-            xs=(params["transformer"], decode_state),
-        )
-
-        # Project to logits
-        logits = ShardedEmbedOut(config=self.config).apply(
-            {"params": params["embed_out"]},
-            layers_out,
-        )
+        logits = self.embed_out(h)
         return {
             "logits": logits,
             "new_decode_state": new_decode_state,
         }
 
-    def _generate(self, params, ctx, ctx_length, rng, generate_length, sampler_args):
-        init_out = self._get_initial_decode_state(
-            params=params,
+    def generate(self, ctx, ctx_length, rng, generate_length, aux, sampler_args):
+        init_out = self.get_initial_decode_state(
             ctx=ctx,
             ctx_length=ctx_length
         )
         # Add sampling logic here
+        print(init_out["logits"].shape)
         initial_token = init_out["logits"].argmax(-1)
 
         init_carry = {
             "single_x": initial_token,
             "decode_state": init_out["decode_state"],
+            "rng": rng,
         }
+        print("init_carry", init_carry["decode_state"][0]["v"])
 
-        def _decode_once_scan_fn(decode_carry, step_rng):
-            decode_out = self._decode_once(
-                params=params,
+        def _decode_once_scan_fn(module, decode_carry, _):
+            step_rng, next_rng = jax.random.split(decode_carry["rng"])
+            print("decode_carry", decode_carry["decode_state"][0]["v"])
+            decode_out = module.decode_once(
                 single_x=decode_carry["single_x"],
                 decode_state=decode_carry["decode_state"],
             )
-
-            # Add sampling logic here
-            # next_token = decode_out["logits"].argmax(-1)
             next_token = temperature_sample(
                 key=step_rng,
                 logits=decode_out["logits"],
                 **sampler_args,
             )
-
             next_carry = {
                 "single_x": next_token,
                 "decode_state": decode_out["new_decode_state"]
@@ -131,20 +113,30 @@ class GPTNeoX20BModel(nn.Module):
             outputs = {
                 "logits": decode_out["logits"],
                 "next_token": next_token,
+                "rng": next_rng,
             }
             return next_carry, outputs
 
-        final_state, generation_outputs = jax.lax.scan(
-            f=_decode_once_scan_fn,
-            init=init_carry,
-            xs=jax.random.split(rng, generate_length),
-        )
+        final_state, generation_outputs = nn.scan(
+            target=_decode_once_scan_fn,
+            in_axes=0,
+            variable_broadcast="params",
+            split_rngs={"params": False},
+            length=64,
+        )(self, init_carry, aux)
+        return {
+            # "final_state": final_state,
+            "initial_logits": init_out["logits"],
+            "initial_token": initial_token,
+            "generated_logits": generation_outputs["logits"],
+            "generated_tokens": generation_outputs["next_token"],
+        }
         tokens = generation_outputs["next_token"].swapaxes(0, 1)[:, :, 0]
         logits = generation_outputs["logits"].swapaxes(0, 1)[:, :, 0]
         return {
             # "final_state": final_state,
             "generated_logits": jnp.concatenate((init_out["logits"], logits), axis=1),
-            "generated_tokens": jnp.concatenate((initial_token, tokens), axis=1, ),
+            "generated_tokens": jnp.concatenate((initial_token, tokens), axis=1),
         }
 
 
@@ -159,9 +151,7 @@ class ShardedEmbedIn(nn.Module):
         shard_start_index = jax.lax.axis_index('shard') * dims_per_shard
 
         # TODO: Check if this still works
-        print(input_ids.dtype)
         input_onehot = jax.nn.one_hot(input_ids - shard_start_index, dims_per_shard, dtype=jnp.float16)
-        print(input_onehot.dtype)
         embedded = nn.Dense(
             features=config.hidden_size,
             kernel_init=zero_init_fp16(),
@@ -169,9 +159,7 @@ class ShardedEmbedIn(nn.Module):
             name="embed",
             dtype=jnp.float16,
         )(input_onehot)
-        print(embedded.dtype)
         embedded = g_psum(embedded)
-        print(embedded.dtype)
         return embedded
 
 
