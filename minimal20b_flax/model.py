@@ -445,7 +445,7 @@ class ShardedTransformerLayer(nn.Module):
         ff_out = shard_to(ff_out, P("dp", None, "tp"))
         ff_out = jax.nn.gelu(ff_out)
         ff_out = self.ff_down_proj(ff_out)
-        ff_out = shard_to(ff_out, P("dp", None, None))
+        ff_out = shard_to(ff_out, P("dp", None, "mp"))
         return ff_out
 
     # iterate the decoding process by a single token

@@ -117,3 +117,53 @@ def get_default_mesh():
     devices = jax.local_devices()
     return maps.Mesh(np.asarray(devices).reshape(1, 8), ('dp', 'tp'))
 
+
+# identity in forward pass, psum in backward
+@jax.custom_vjp
+def f_psum(x):
+    return x
+
+
+def f_psum_fwd(x):
+    return f_psum(x), None
+
+
+def f_psum_bwd(_, g):
+    return jax.lax.psum(g, "shard"),
+
+
+f_psum.defvjp(f_psum_fwd, f_psum_bwd)
+
+
+# identity in forward pass, pmean in backward
+@jax.custom_vjp
+def f_pmean(x):
+    return x
+
+
+def f_pmean_fwd(x):
+    return f_psum(x), None
+
+
+def f_pmean_bwd(_, g):
+    return jax.lax.pmean(g, "shard"),
+
+
+f_pmean.defvjp(f_pmean_fwd, f_pmean_bwd)
+
+
+# psum in forward pass, identity in backward
+@jax.custom_vjp
+def g_psum(x):
+    return jax.lax.psum(x, "shard")
+
+
+def g_psum_fwd(x):
+    return g_psum(x), None
+
+
+def g_psum_bwd(_, g):
+    return g,
+
+
+g_psum.defvjp(g_psum_fwd, g_psum_bwd)

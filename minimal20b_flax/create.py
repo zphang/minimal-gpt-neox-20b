@@ -388,3 +388,42 @@ def colab_load_single_layer_ff_down_kernel_params(checkpoint_path, layer_i, orig
     filename = f"layer_{layer_i + 2:02d}-model_{original_shard:02d}-model_states.pt"
     loaded = load_to_numpy(os.path.join(checkpoint_path, filename))
     return loaded["mlp.dense_4h_to_h.weight"].T
+
+
+# === Xmap specific ===
+
+def load_single_layer_params_for_xmap(checkpoint_path, layer_i):
+    num_shards = 8
+    transformer_layer_params = load_single_layer_params(checkpoint_path=checkpoint_path, layer_i=layer_i)
+    fparams = frozen_dict.unfreeze(traverse_util.flatten_dict(transformer_layer_params))
+    # noinspection PyDictCreation
+    new_fparams = {}
+    new_fparams[('attn_norm', 'bias')] = \
+        stack_copies(fparams[('attn_norm', 'bias')], num_shards, axis=0)
+    new_fparams[('attn_norm', 'scale')] = \
+        stack_copies(fparams[('attn_norm', 'scale')], num_shards, axis=0)
+    new_fparams[('ff_down_proj', 'bias')] = \
+        stack_copies(fparams[('ff_down_proj', 'bias')], num_shards, axis=0) / 8
+    new_fparams[('ff_down_proj', 'kernel')] = \
+        fparams[('ff_down_proj', 'kernel')].reshape(8, 3072, 6144)
+    new_fparams[('ff_norm', 'bias')] = \
+        stack_copies(fparams[('ff_norm', 'bias')], num_shards, axis=0)
+    new_fparams[('ff_norm', 'scale')] = \
+        stack_copies(fparams[('ff_norm', 'scale')], num_shards, axis=0)
+    new_fparams[('ff_up_proj', 'bias')] = \
+        fparams[('ff_up_proj', 'bias')].reshape(8, 3072)
+    new_fparams[('ff_up_proj', 'kernel')] = \
+        fparams[('ff_up_proj', 'kernel')].reshape(6144, 8, 3072).swapaxes(0, 1)
+    new_fparams[('output_proj', 'bias')] = \
+        stack_copies(fparams[('output_proj', 'bias')], num_shards, axis=0) / 8
+    new_fparams[('output_proj', 'kernel')] = \
+        fparams[('output_proj', 'kernel')].reshape(8, 768, 6144)
+    new_fparams[('qkv_proj', 'bias')] = \
+        fparams[('qkv_proj', 'bias')].reshape(8, 2304)
+    new_fparams[('qkv_proj', 'kernel')] = \
+        fparams[('qkv_proj', 'kernel')].reshape(6144, 8, 2304).swapaxes(0, 1)
+    return new_fparams
+
+
+def stack_copies(x, num, axis=0):
+    return np.stack([x] * num, axis=axis)
