@@ -36,7 +36,7 @@ class EvalHarnessAdapter(GPT2LM):
     An adapter to run NeoX models on LM Evaluation Harness (https://github.com/EleutherAI/lm-evaluation-harness) tasks.
     """
 
-    def __init__(self, weights, mesh, tokenizer):
+    def __init__(self, weights, mesh, tokenizer, batch_size):
 
         config = model_xmap.NeoX20BConfig()
         self.VOCAB_SIZE = config.vocab_size
@@ -48,11 +48,11 @@ class EvalHarnessAdapter(GPT2LM):
         self.max_length = 2048
         self.max_gen_toks = 128
 
-        self.batch_size = 1
+        self.batch_size = batch_size
 
         neox_model = model_xmap.GPTNeoX20BModel(config=config)
         self.eval_apply_fn_xmap = jax.experimental.maps.xmap(
-            neox_model.eval,
+            neox_model.get_batch_eval_fn(),
             in_axes=(
                 ["shard", ...],
                 [...],
@@ -150,23 +150,20 @@ class EvalHarnessAdapter(GPT2LM):
             max_length = candidate_length
 
         assert max_length >= length
-        mask = jnp.zeros([1, max_length, max_length])
+        mask = jnp.zeros([inps.shape[0], max_length, max_length])
 
         inps_arr = inps.numpy()
         padded_inps = np.concatenate([
             inps_arr,
             np.zeros((inps_arr.shape[0], max_length - length), dtype=np.int32),
         ], axis=1)
-
-        assert padded_inps.shape[0] == 1
         with maps.mesh(self.mesh.devices, self.mesh.axis_names):
             logits = self.eval_apply_fn_xmap(
                 self.weights,
-                padded_inps[0],
-                mask[0],
+                padded_inps,
+                mask,
             )
-            # import pdb; pdb.set_trace()
-            logits = logits.swapaxes(0, 1).reshape(1, max_length, -1)
+            logits = logits.swapaxes(1, 2).reshape(-1, max_length, self.VOCAB_SIZE)
             logits = torch.tensor(np.array(logits), dtype=torch.float32)
 
         return logits
@@ -190,6 +187,7 @@ def main():
     parser.add_argument('--tokenizer_path', type=str, required=True)
     parser.add_argument('--tasks', type=str, required=True)
     parser.add_argument('--output_path', type=str, default=None)
+    parser.add_argument('--batch_size', type=int, default=4)
     args = parser.parse_args()
 
     # Set up mesh for TPU
@@ -199,7 +197,12 @@ def main():
     tokenizer = create.create_tokenizer(args.tokenizer_path)
     weights = create.load_model_weights_for_xmap(args.model_path)
 
-    adapter = EvalHarnessAdapter(weights=weights, mesh=mesh, tokenizer=tokenizer)
+    adapter = EvalHarnessAdapter(
+        weights=weights,
+        mesh=mesh,
+        tokenizer=tokenizer,
+        batch_size=args.batch_size,
+    )
     print("Running evaluation harness...")
     results = adapter.run_eval(
         eval_tasks=args.tasks.split(","),

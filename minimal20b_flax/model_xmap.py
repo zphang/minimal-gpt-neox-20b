@@ -45,6 +45,9 @@ class GPTNeoX20BModel:
             h = h + residual
         return ShardedEmbedOut(config=self.config).apply({"params": params["embed_out"]}, h)
 
+    def get_batch_eval_fn(self):
+        return jax.vmap(self.eval, in_axes=[None, 0, 0])
+
     def get_initial_decode_state(self, params, ctx, ctx_length):
         # Embed initial context
         embedded = ShardedEmbedIn(config=self.config).apply(
