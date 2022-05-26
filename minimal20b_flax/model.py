@@ -178,12 +178,12 @@ class GPTNeoX20BModel:
             )
 
             # Add sampling logic here
-            # next_token = decode_out["logits"].argmax(-1)
-            next_token = temperature_sample(
-                key=step_rng,
-                logits=decode_out["logits"],
-                **sampler_args,
-            )
+            next_token = decode_out["logits"].argmax(-1)
+            # next_token = temperature_sample(
+            #     key=step_rng,
+            #     logits=decode_out["logits"],
+            #     **sampler_args,
+            # )
 
             next_carry = {
                 "single_x": next_token,
@@ -205,7 +205,9 @@ class GPTNeoX20BModel:
         return {
             # "final_state": final_state,
             "generated_logits": jnp.concatenate((init_out["logits"], logits), axis=1),
-            "generated_tokens": jnp.concatenate((initial_token, tokens), axis=1, ),
+            "generated_tokens": jnp.concatenate((initial_token, tokens), axis=1),
+            "final_state": final_state,
+            "initial_state": init_out["decode_state"],
         }
 
     def generate_pjit(self):
@@ -220,6 +222,8 @@ class GPTNeoX20BModel:
             out_axis_resources={
                 "generated_logits": P("dp", None, "tp"),
                 "generated_tokens": P("dp"),
+                "final_state": P("dp"),
+                "initial_state": P("dp"),
             },
             static_argnums=(4, 5),
         )
@@ -445,7 +449,7 @@ class ShardedTransformerLayer(nn.Module):
         ff_out = shard_to(ff_out, P("dp", None, "tp"))
         ff_out = jax.nn.gelu(ff_out)
         ff_out = self.ff_down_proj(ff_out)
-        ff_out = shard_to(ff_out, P("dp", None, "mp"))
+        ff_out = shard_to(ff_out, P("dp", None, "tp"))
         return ff_out
 
     # iterate the decoding process by a single token
@@ -458,8 +462,6 @@ class ShardedTransformerLayer(nn.Module):
         # -> [batch, q_len=1, hidden_size]
         q, v, k = self.compute_qkv(attn_in)
         # -> 3 x [batch, q_len=1, heads, dims_per_head]
-
-        # ?? assert x.shape[0] == 1
 
         # add new kv to end, clip off the start
         v = jnp.concatenate((decode_state["v"], v), axis=1)[:, 1:]

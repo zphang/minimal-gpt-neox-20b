@@ -1,6 +1,7 @@
 import os
 
 import jax
+from multiprocessing import Pool
 from tqdm import auto as tqdm_lib
 
 import numpy as np
@@ -425,7 +426,10 @@ def load_single_layer_params_for_xmap(checkpoint_path, layer_i):
     return new_fparams
 
 
-def load_model_weights_for_xmap(checkpoint_path, config: model.NeoX20BConfig = model.default_neox20b_config):
+def load_model_weights_for_xmap(
+        checkpoint_path,
+        config: model.NeoX20BConfig = model.default_neox20b_config,
+        pool_size=None):
     flattened_params = {}
     loaded_tp1 = load_to_numpy(os.path.join(checkpoint_path, "layer_00-model_00-model_states.pt"))
     loaded_tp2 = load_to_numpy(os.path.join(checkpoint_path, "layer_00-model_01-model_states.pt"))
@@ -461,15 +465,33 @@ def load_model_weights_for_xmap(checkpoint_path, config: model.NeoX20BConfig = m
     del loaded_tp1
     del loaded_tp2
 
-    for layer_i in tqdm_lib.trange(config.num_layers):
-        layer_params = load_single_layer_params_for_xmap(
-            checkpoint_path=checkpoint_path,
-            layer_i=layer_i,
-        )
-        for k, v in layer_params.items():
-            flattened_params[(f"layer_{layer_i:02d}",) + k] = v
+    if pool_size is None:
+        for layer_i in tqdm_lib.trange(config.num_layers):
+            layer_params = load_single_layer_params_for_xmap(
+                checkpoint_path=checkpoint_path,
+                layer_i=layer_i,
+            )
+            for k, v in layer_params.items():
+                flattened_params[(f"layer_{layer_i:02d}",) + k] = v
+    else:
+        pool = Pool(processes=pool_size)
+
+        pool_args = [(checkpoint_path, layer_i) for layer_i in range(config.num_layers)]
+        for layer_i, layer_params in tqdm_lib.tqdm(pool.imap(pool_func, pool_args), total=len(pool_args)):
+            for k, v in layer_params.items():
+                flattened_params[(f"layer_{layer_i:02d}",) + k] = v
+
     params = traverse_util.unflatten_dict(flattened_params)
     return params
+
+
+def pool_func(arg):
+    checkpoint_path, layer_i = arg
+    loaded_layer = load_single_layer_params_for_xmap(
+        checkpoint_path=checkpoint_path,
+        layer_i=layer_i,
+    )
+    return layer_i, loaded_layer
 
 
 def stack_copies(x, num, axis=0):

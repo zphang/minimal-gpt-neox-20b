@@ -188,6 +188,7 @@ def main():
     parser.add_argument('--tasks', type=str, required=True)
     parser.add_argument('--output_path', type=str, default=None)
     parser.add_argument('--batch_size', type=int, default=4)
+    parser.add_argument('--pool_size', type=int, default=None)
     args = parser.parse_args()
 
     # Set up mesh for TPU
@@ -195,7 +196,7 @@ def main():
     mesh = maps.Mesh(np.asarray(devices).reshape(1, 8), ('dp', 'tp'))
 
     tokenizer = create.create_tokenizer(args.tokenizer_path)
-    weights = create.load_model_weights_for_xmap(args.model_path)
+    weights = create.load_model_weights_for_xmap(args.model_path, pool_size=args.pool_size)
 
     adapter = EvalHarnessAdapter(
         weights=weights,

@@ -34,6 +34,7 @@ default_neox20b_config = NeoX20BConfig()
 class GPTNeoX20BModel:
 
     config: NeoX20BConfig = default_neox20b_config
+    generate_length: int = 2048
 
     def eval(self, params, x, mask):
         embedded = ShardedEmbedIn(config=self.config).apply({"params": params["embed_in"]}, x)
@@ -64,7 +65,6 @@ class GPTNeoX20BModel:
             )
             decode_state_list.append(layer_decode_state)
             h = h + new_residual
-        print(h.shape)
         final_logit = ShardedEmbedOut(config=self.config).apply(
             {"params": params["embed_out"]},
             h[-1:, :],
@@ -97,7 +97,6 @@ class GPTNeoX20BModel:
         }
 
     def generate(self, params, ctx, ctx_length, rng, sampler_args):
-        GENERATE_LENGTH = 64
         init_out = self.get_initial_decode_state(
             params=params,
             ctx=ctx,
@@ -105,12 +104,14 @@ class GPTNeoX20BModel:
         )
         # Add sampling logic here
         init_logits = init_out["logits"].swapaxes(0, 1).reshape(1, self.config.vocab_size)
+        print("init_logits", init_logits.shape)
         initial_token = init_logits.argmax(-1)
 
         init_carry = {
             "single_x": initial_token,
             "decode_state": init_out["decode_state"],
         }
+        print("initial_token", initial_token.shape)
 
         def _decode_once_scan_fn(decode_carry, step_rng):
             decode_out = self.decode_once(
@@ -120,19 +121,21 @@ class GPTNeoX20BModel:
             )
 
             # Add sampling logic here
-            # next_token = decode_out["logits"].argmax(-1)
-            next_token = temperature_sample(
-                key=step_rng,
-                logits=decode_out["logits"].swapaxes(0, 1).reshape(1, self.config.vocab_size),
-                **sampler_args,
-            )
+            decode_out_logits = decode_out["logits"].swapaxes(0, 1).reshape(1, self.config.vocab_size)
+            print("decode_out_logits", decode_out_logits.shape)
+            next_token = decode_out_logits.argmax(-1)
+            # next_token = temperature_sample(
+            #     key=step_rng,
+            #     logits=decode_out["logits"].swapaxes(0, 1).reshape(1, self.config.vocab_size),
+            #     **sampler_args,
+            # )
 
             next_carry = {
                 "single_x": next_token,
                 "decode_state": decode_out["new_decode_state"]
             }
             outputs = {
-                "logits": decode_out["logits"],
+                "logits": decode_out_logits,
                 "next_token": next_token,
             }
             return next_carry, outputs
@@ -140,7 +143,7 @@ class GPTNeoX20BModel:
         final_state, generation_outputs = jax.lax.scan(
             f=_decode_once_scan_fn,
             init=init_carry,
-            xs=jax.random.split(rng, GENERATE_LENGTH),
+            xs=jax.random.split(rng, self.generate_length),
         )
         # return {
         #     # "final_state": final_state,
@@ -151,11 +154,13 @@ class GPTNeoX20BModel:
         # }
 
         tokens = generation_outputs["next_token"][:, 0]
-        logits = generation_outputs["logits"].swapaxes(0, 1).reshape(-1, self.config.vocab_size)
+        logits = generation_outputs["logits"][:, 0]  #.swapaxes(0, 1).reshape(-1, self.config.vocab_size)
         return {
             # "final_state": final_state,
             "generated_logits": jnp.concatenate((init_logits, logits), axis=0),
             "generated_tokens": jnp.concatenate((initial_token, tokens), axis=0),
+            "final_state": final_state,
+            "initial_state": init_out["decode_state"],
         }
 
 
@@ -287,7 +292,7 @@ class ShardedTransformerLayer(nn.Module):
         q_rot = q[..., :rotary_dims]
         q_pass = q[..., rotary_dims:]
 
-        sincos = fixed_pos_embedding(k_rot, seq_dim=0)  # TODO check this
+        sincos = fixed_pos_embedding(k_rot, seq_dim=0)
         # return sincos
         q_rot = apply_rotary_pos_emb(q_rot, sincos)
         k_rot = apply_rotary_pos_emb(k_rot, sincos)
@@ -328,20 +333,18 @@ class ShardedTransformerLayer(nn.Module):
     def decode_once(self, decode_state, x):
         """
         :param decode_state:
-        :param x: [batch, q_len=1, hidden_size]
+        :param x: [q_len=1, hidden_size]
         """
         attn_in = self.attn_norm(x)
-        print("attn_in", attn_in)
+        # print("attn_in", attn_in)
         # -> [q_len=1, hidden_size]
         q, v, k = self.compute_qkv(attn_in)
-        print("v", v)
+        # print("v", v)
         # -> 3 x [q_len=1, heads, dims_per_head]
-
-        # ?? assert x.shape[0] == 1
 
         # add new kv to end, clip off the start
         v = jnp.concatenate((decode_state["v"], v), axis=0)[1:]
-        print("v2", v)
+        # print("v2", v)
         # -> [kv_len+1, heads, dims_per_head]
         k = jnp.concatenate((decode_state["k"], k), axis=0)[1:]
         # -> [kv_len+1, heads, dims_per_head]
@@ -349,22 +352,22 @@ class ShardedTransformerLayer(nn.Module):
         tokens_decoded = decode_state["tokens_decoded"] + 1
 
         length = v.shape[0]
-        masked_tokens = (length - tokens_decoded)[None]
-        print("masked_tokens", masked_tokens)
+        masked_tokens = length - tokens_decoded
+        # print("masked_tokens", masked_tokens)
         attention_mask = (jnp.arange(0, length) < masked_tokens)[None, :]
-        print("attention_mask", attention_mask)
+        # print("attention_mask", attention_mask)
         # -> [q_len=1, seq_len]
 
         bias = (-1e4 * attention_mask)
-        print("bias", bias)
+        # print("bias", bias)
         # -> [q_len=1, seq_len]
 
         attn_out = self.compute_self_attn(q, v, k, bias)
-        print("attn_out", attn_out)
+        # print("attn_out", attn_out)
         # -> 3 x [q_len=1, hidden]
 
         ff_out = self.compute_ff(x)
-        print("ff_out", ff_out)
+        # print("ff_out", ff_out)
         # -> 3 x [q_len=1, hidden]
 
         return g_psum(attn_out + ff_out), {
@@ -381,12 +384,12 @@ class ShardedTransformerLayer(nn.Module):
         """
         x = f_psum(x)
         attn_in = self.attn_norm(x)
-        # -> [batch, seq_len, hidden_size]
+        # -> [seq_len, hidden_size]
         q, v, k = self.compute_qkv(attn_in)
-        # -> 3 x [batch, seq_len, heads, dims_per_head]
+        # -> 3 x [seq_len, heads, dims_per_head]
 
         full_length = x.shape[0]
-        masked_tokens = (full_length - given_length)[None]
+        masked_tokens = full_length - given_length
 
         causal_mask = np.tril(np.ones((full_length, full_length)))
         # -> [seq_len, seq_len]
@@ -400,7 +403,7 @@ class ShardedTransformerLayer(nn.Module):
         bias -= 1e4 * context_length_mask  # mask out zero tokens before context starts
         # -> [seq_len, seq_len]
 
-        attn_out = self.compute_self_attn(q, v, k, bias[None, :, :])
+        attn_out = self.compute_self_attn(q, v, k, bias)
         # -> [seq_len, hidden]
 
         ff_out = self.compute_ff(x)
@@ -493,18 +496,22 @@ class ReplicatedLayerNorm(nn.Module):
 
 
 def fixed_pos_embedding(x, seq_dim=0):
+    # x: [seq_len, head, head_dim//4]
     dim = x.shape[-1]
-    inv_freq = 1. / (10000 ** (np.arange(0, dim, 2) / dim)) .astype(np.float16)
-    sinusoid_inp = np.einsum('i , j -> i j', np.arange(x.shape[seq_dim]), inv_freq) .astype(np.float16)
+    inv_freq = 1. / (10000 ** (np.arange(0, dim, 2) / dim)).astype(np.float16)
+    sinusoid_inp = np.einsum('i , j -> i j', np.arange(x.shape[seq_dim]), inv_freq).astype(np.float16)
     return np.sin(sinusoid_inp).astype(np.float16), np.cos(sinusoid_inp).astype(np.float16)
 
 
 def apply_rotary_pos_emb(x, sincos):
-    sin, cos = map(lambda t: repeat(t, '... b n -> ... b (j n)', j=2)[-x.shape[-3]:, None, :], sincos)
+    # x: [seq_len, head, head_dim//4]
+    sin, cos = map(lambda t: repeat(t, '... n -> ... (j n)', j=2)[-x.shape[-3]:, None, :], sincos)
+    # sin: [seq_len, 1, head_dim//4//2]
     return (x * cos) + (rotate_half(x) * sin)
 
 
 def rotate_half(x):
+    # x: [seq_len, head, head_dim//4]
     half_dim = x.shape[-1] // 2
     x1 = x[:, :, :half_dim]
     x2 = x[:, :, half_dim:]
