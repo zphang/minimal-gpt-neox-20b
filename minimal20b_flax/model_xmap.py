@@ -4,14 +4,11 @@ from einops import repeat
 import jax
 import jax.numpy as jnp
 # noinspection PyPep8Naming
-from jax.experimental import PartitionSpec as P
-from jax.experimental.pjit import pjit
 from jax.nn.initializers import zeros
 
 import flax.linen as nn
 from flax import struct
 from flax.core import frozen_dict
-from flax import traverse_util
 from minimal20b_flax.utils import f_psum, g_psum
 
 
@@ -35,6 +32,7 @@ class GPTNeoX20BModel:
 
     config: NeoX20BConfig = default_neox20b_config
     generate_length: int = 2048
+    sampler_args: dict = frozen_dict.FrozenDict({"temp": 1.})
 
     def eval(self, params, x, mask):
         embedded = ShardedEmbedIn(config=self.config).apply({"params": params["embed_in"]}, x)
@@ -96,7 +94,7 @@ class GPTNeoX20BModel:
             "new_decode_state": new_decode_state_list,
         }
 
-    def generate(self, params, ctx, ctx_length, rng, sampler_args):
+    def generate(self, params, ctx, ctx_length, rng):
         init_out = self.get_initial_decode_state(
             params=params,
             ctx=ctx,
@@ -104,14 +102,12 @@ class GPTNeoX20BModel:
         )
         # Add sampling logic here
         init_logits = init_out["logits"].swapaxes(0, 1).reshape(1, self.config.vocab_size)
-        print("init_logits", init_logits.shape)
         initial_token = init_logits.argmax(-1)
 
         init_carry = {
             "single_x": initial_token,
             "decode_state": init_out["decode_state"],
         }
-        print("initial_token", initial_token.shape)
 
         def _decode_once_scan_fn(decode_carry, step_rng):
             decode_out = self.decode_once(
@@ -122,13 +118,11 @@ class GPTNeoX20BModel:
 
             # Add sampling logic here
             decode_out_logits = decode_out["logits"].swapaxes(0, 1).reshape(1, self.config.vocab_size)
-            print("decode_out_logits", decode_out_logits.shape)
-            next_token = decode_out_logits.argmax(-1)
-            # next_token = temperature_sample(
-            #     key=step_rng,
-            #     logits=decode_out["logits"].swapaxes(0, 1).reshape(1, self.config.vocab_size),
-            #     **sampler_args,
-            # )
+            next_token = temperature_sample(
+                key=step_rng,
+                logits=decode_out["logits"].swapaxes(0, 1).reshape(1, self.config.vocab_size),
+                **self.sampler_args,
+            )
 
             next_carry = {
                 "single_x": next_token,
@@ -145,22 +139,13 @@ class GPTNeoX20BModel:
             init=init_carry,
             xs=jax.random.split(rng, self.generate_length),
         )
-        # return {
-        #     # "final_state": final_state,
-        #     "initial_logits": init_out["logits"],
-        #     "initial_token": initial_token,
-        #     "generated_logits": generation_outputs["logits"],
-        #     "generated_tokens": generation_outputs["next_token"],
-        # }
 
         tokens = generation_outputs["next_token"][:, 0]
-        logits = generation_outputs["logits"][:, 0]  #.swapaxes(0, 1).reshape(-1, self.config.vocab_size)
+        logits = generation_outputs["logits"][:, 0]
         return {
             # "final_state": final_state,
             "generated_logits": jnp.concatenate((init_logits, logits), axis=0),
             "generated_tokens": jnp.concatenate((initial_token, tokens), axis=0),
-            "final_state": final_state,
-            "initial_state": init_out["decode_state"],
         }
 
 
@@ -336,15 +321,12 @@ class ShardedTransformerLayer(nn.Module):
         :param x: [q_len=1, hidden_size]
         """
         attn_in = self.attn_norm(x)
-        # print("attn_in", attn_in)
         # -> [q_len=1, hidden_size]
         q, v, k = self.compute_qkv(attn_in)
-        # print("v", v)
         # -> 3 x [q_len=1, heads, dims_per_head]
 
         # add new kv to end, clip off the start
         v = jnp.concatenate((decode_state["v"], v), axis=0)[1:]
-        # print("v2", v)
         # -> [kv_len+1, heads, dims_per_head]
         k = jnp.concatenate((decode_state["k"], k), axis=0)[1:]
         # -> [kv_len+1, heads, dims_per_head]
@@ -353,24 +335,19 @@ class ShardedTransformerLayer(nn.Module):
 
         length = v.shape[0]
         masked_tokens = length - tokens_decoded
-        # print("masked_tokens", masked_tokens)
         attention_mask = (jnp.arange(0, length) < masked_tokens)[None, :]
-        # print("attention_mask", attention_mask)
         # -> [q_len=1, seq_len]
 
         bias = (-1e4 * attention_mask)
-        # print("bias", bias)
         # -> [q_len=1, seq_len]
 
         attn_out = self.compute_self_attn(q, v, k, bias)
-        # print("attn_out", attn_out)
         # -> 3 x [q_len=1, hidden]
 
         ff_out = self.compute_ff(x)
-        # print("ff_out", ff_out)
         # -> 3 x [q_len=1, hidden]
 
-        return attn_out + ff_out, {
+        return (attn_out + ff_out), {
             "tokens_decoded": tokens_decoded,
             "k": k,
             "v": v
@@ -409,7 +386,7 @@ class ShardedTransformerLayer(nn.Module):
         ff_out = self.compute_ff(x)
         # -> [seq_len, hidden]
 
-        return attn_out + ff_out, {
+        return (attn_out + ff_out), {
             "tokens_decoded": given_length.astype(jnp.uint32),
             "k": k,
             "v": v,

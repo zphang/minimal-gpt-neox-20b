@@ -444,19 +444,13 @@ class ShardedTransformerLayer(nn.Module):
         return attn_out
 
     def compute_ff(self, x):
-        misc = {}
         ff_out = self.ff_norm(x)
-        misc["norm"] = ff_out
         ff_out = self.ff_up_proj(ff_out)
-        misc["up"] = ff_out
         ff_out = shard_to(ff_out, P("dp", None, "tp"))
         ff_out = jax.nn.gelu(ff_out)
-        misc["gelu"] = ff_out
         ff_out = self.ff_down_proj(ff_out)
-        misc["down"] = ff_out
-        print("down", ff_out.dtype)
         ff_out = shard_to(ff_out, P("dp", None, "tp"))
-        return ff_out, misc
+        return ff_out
 
     # iterate the decoding process by a single token
     def decode_once(self, decode_state, x):
@@ -490,21 +484,13 @@ class ShardedTransformerLayer(nn.Module):
         attn_out = self.compute_self_attn(q, v, k, bias[:, None, :, :])
         # -> 3 x [batch, q_len=1, hidden]
 
-        ff_out, ff_misc = self.compute_ff(x)
+        ff_out = self.compute_ff(x)
         # -> 3 x [batch, q_len=1, hidden]
 
         return (attn_out + ff_out), {
             "tokens_decoded": tokens_decoded,
             "k": k,
             "v": v
-        }, {
-            "x": x,
-            "attn_in": attn_in,
-            "k": k,
-            "attn_out": attn_out,
-            "ff_out": ff_out,
-            "final_out": (attn_out + ff_out),
-            "ff_misc": ff_misc,
         }
 
     # take in right aligned context tokens and generate an initial state

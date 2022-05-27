@@ -1,7 +1,8 @@
 import os
 
-import jax
 from multiprocessing import Pool
+
+import jax
 from tqdm import auto as tqdm_lib
 
 import numpy as np
@@ -483,6 +484,97 @@ def load_model_weights_for_xmap(
 
     params = traverse_util.unflatten_dict(flattened_params)
     return params
+
+
+def colab_load_model_weights_for_xmap(
+        checkpoint_path,
+        config: model.NeoX20BConfig = model.default_neox20b_config):
+    mesh = get_colab_mesh()
+    pbar = tqdm_lib.tqdm(total=47)
+
+    # Embedding
+    pbar.set_description("Loading embed_in")
+    flattened_params = {}
+    loaded_tp1 = load_to_numpy(os.path.join(checkpoint_path, "layer_00-model_00-model_states.pt"))
+    loaded_tp2 = load_to_numpy(os.path.join(checkpoint_path, "layer_00-model_01-model_states.pt"))
+    embed_in = np.concatenate([
+        loaded_tp1["word_embeddings.weight"],
+        loaded_tp2["word_embeddings.weight"],
+    ], axis=0)
+    flattened_params[('embed_in', 'embed', 'kernel')] = shard_to_devices_v2(
+        embed_in.reshape(8, 6304, 6144), mesh=mesh)
+    del loaded_tp1
+    del loaded_tp2
+    pbar.update(1)
+
+    # Load layers
+    for layer_i in range(config.num_layers):
+        pbar.set_description(f"Loading layer {layer_i}")
+        layer_params = load_single_layer_params_for_xmap(
+            checkpoint_path=checkpoint_path,
+            layer_i=layer_i,
+        )
+        for k, v in layer_params.items():
+            flattened_params[(f"layer_{layer_i:02d}",) + k] = shard_to_devices_v2(v, mesh=mesh)
+        del layer_params
+        pbar.update(1)
+
+    # Final layer norm
+    pbar.set_description(f"Load final layer norm")
+    loaded_tp1 = load_to_numpy(os.path.join(checkpoint_path, "layer_47-model_00-model_states.pt"))
+    loaded_tp2 = load_to_numpy(os.path.join(checkpoint_path, "layer_47-model_01-model_states.pt"))
+    # noinspection PyDictCreation
+    final_norm_bias = (loaded_tp1["norm.bias"] + loaded_tp2["norm.bias"]) / 2
+    final_norm_scale = (loaded_tp1["norm.weight"] + loaded_tp2["norm.weight"]) / 2
+    num_shards = 8
+    flattened_params[('embed_out', 'norm', 'bias')] = shard_to_devices_v2(
+        stack_copies(final_norm_bias, num_shards, axis=0), mesh=mesh)
+    flattened_params[('embed_out', 'norm', 'scale')] = shard_to_devices_v2(
+        stack_copies(final_norm_scale, num_shards, axis=0), mesh=mesh)
+    del loaded_tp1
+    del loaded_tp2
+    pbar.update(1)
+
+    # Output embeddings
+    pbar.set_description(f"Load embed_out")
+    loaded_tp1 = load_to_numpy(os.path.join(checkpoint_path, "layer_48-model_00-model_states.pt"))
+    loaded_tp2 = load_to_numpy(os.path.join(checkpoint_path, "layer_48-model_01-model_states.pt"))
+    embed_out = np.concatenate([
+        loaded_tp1["final_linear.weight"].T,
+        loaded_tp2["final_linear.weight"].T,
+    ], axis=1)
+    flattened_params[('embed_out', 'embed_out', 'kernel')] = shard_to_devices_v2(
+        embed_out.reshape(6144, 8, 6304).swapaxes(0, 1), mesh=mesh)
+    del loaded_tp1
+    del loaded_tp2
+    pbar.update(1)
+
+    params = traverse_util.unflatten_dict(flattened_params)
+    return params
+
+
+def get_colab_mesh():
+    return maps.Mesh(np.asarray(jax.local_devices()).reshape(1, 8), ('dp', 'tp'))
+
+
+def identity(x):
+    return x
+
+
+def shard_to_devices_v2(x, mesh):
+    shard_to = jax.experimental.maps.xmap(
+        identity,
+        in_axes=["shard", ...],
+        out_axes=["shard", ...],
+        axis_resources={'shard': 'tp', 'batch': 'dp'},
+    )
+    with mesh:
+        return shard_to(x)
+
+
+def shard_to_devices_v3(x):
+    assert x.shape[0] == 8
+    return jax.device_put_sharded(list(x), devices=jax.local_devices())
 
 
 def pool_func(arg):
