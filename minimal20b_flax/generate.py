@@ -59,4 +59,5 @@ def generate(input_string: str,
     return {
         "generated_string": tokenizer.decode(output["generated_tokens"]),
         "generated_tokens": np.array(output["generated_tokens"]),
+        "generated_logits": np.array(output["generated_logits"]),
     }
