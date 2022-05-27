@@ -201,8 +201,8 @@ class ShardedTransformerLayer(nn.Module):
         self.dims_per_head = config.hidden_size // config.num_attention_heads
         self.heads_per_shard = config.num_attention_heads // config.tp_num
         self.dims_per_shard = config.hidden_size // config.tp_num
-        self.attn_norm = ReplicatedLayerNorm(epsilon=config.layernorm_epsilon, dtype=jnp.float16)
-        self.ff_norm = ReplicatedLayerNorm(epsilon=config.layernorm_epsilon, dtype=jnp.float16)
+        self.attn_norm = nn.LayerNorm(epsilon=config.layernorm_epsilon, dtype=jnp.float16)
+        self.ff_norm = nn.LayerNorm(epsilon=config.layernorm_epsilon, dtype=jnp.float16)
         self.qkv_proj = nn.Dense(
             self.dims_per_shard * 3,
             name="qkv_proj",
@@ -220,14 +220,14 @@ class ShardedTransformerLayer(nn.Module):
         self.ff_up_proj = nn.Dense(
             self.dims_per_shard * 4,
             name="ff_up_proj",
-            dtype=jnp.float16,
+            dtype=jnp.float32,
             kernel_init=zero_init_fp16(),
             bias_init=zero_init_fp16(),
         )
         self.ff_down_proj = nn.Dense(
             config.hidden_size,
             name="ff_down_proj",
-            dtype=jnp.float16,
+            dtype=jnp.float32,
             kernel_init=zero_init_fp16(),
             bias_init=zero_init_fp16(),
         )
@@ -317,17 +317,24 @@ class ShardedTransformerLayer(nn.Module):
         attention_vec = attention_vec.reshape(-1, self.dims_per_shard)
         # -> [q_len, hidden]
 
-        attn_out = self.output_proj(attention_vec)
+        attn_out = g_psum(self.output_proj(attention_vec))
         # -> [q_len, hidden]
 
         return attn_out
 
     def compute_ff(self, x):
+        misc = {}
         ff_out = self.ff_norm(x)
+        misc["norm"] = ff_out
         ff_out = self.ff_up_proj(ff_out)
+        misc["up"] = ff_out
+        print("up", ff_out.dtype)
         ff_out = jax.nn.gelu(ff_out)
-        ff_out = self.ff_down_proj(ff_out)
-        return ff_out
+        misc["gelu"] = ff_out
+        ff_out = g_psum(self.ff_down_proj(ff_out))
+        misc["down"] = ff_out
+        print("down", ff_out.dtype)
+        return ff_out.astype(jnp.float16), misc
 
     # iterate the decoding process by a single token
     def decode_once(self, decode_state, x):
@@ -366,14 +373,22 @@ class ShardedTransformerLayer(nn.Module):
         # print("attn_out", attn_out)
         # -> 3 x [q_len=1, hidden]
 
-        ff_out = self.compute_ff(x)
+        ff_out, ff_misc = self.compute_ff(x)
         # print("ff_out", ff_out)
         # -> 3 x [q_len=1, hidden]
 
-        return g_psum(attn_out + ff_out), {
+        return attn_out + ff_out, {
             "tokens_decoded": tokens_decoded,
             "k": k,
             "v": v
+        }, {
+            "x": x,
+            "attn_in": attn_in,
+            "k": k,
+            "attn_out": attn_out,
+            "ff_out": ff_out,
+            "final_out": (attn_out + ff_out),
+            "ff_misc": ff_misc,
         }
 
     # take in right aligned context tokens and generate an initial state
