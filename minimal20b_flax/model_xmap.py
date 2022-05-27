@@ -220,14 +220,14 @@ class ShardedTransformerLayer(nn.Module):
         self.ff_up_proj = nn.Dense(
             self.dims_per_shard * 4,
             name="ff_up_proj",
-            dtype=jnp.float32,
+            dtype=jnp.float16,
             kernel_init=zero_init_fp16(),
             bias_init=zero_init_fp16(),
         )
         self.ff_down_proj = nn.Dense(
             config.hidden_size,
             name="ff_down_proj",
-            dtype=jnp.float32,
+            dtype=jnp.float16,
             kernel_init=zero_init_fp16(),
             bias_init=zero_init_fp16(),
         )
@@ -258,7 +258,7 @@ class ShardedTransformerLayer(nn.Module):
         ff_out = self.compute_ff(x)
         # -> [seq_len, hidden]
 
-        return g_psum(attn_out + ff_out)
+        return attn_out + ff_out
 
     def split_heads(self, x):
         reshaped = x.reshape(x.shape[:-1] + (self.heads_per_shard, self.dims_per_head))
@@ -323,18 +323,11 @@ class ShardedTransformerLayer(nn.Module):
         return attn_out
 
     def compute_ff(self, x):
-        misc = {}
         ff_out = self.ff_norm(x)
-        misc["norm"] = ff_out
         ff_out = self.ff_up_proj(ff_out)
-        misc["up"] = ff_out
-        print("up", ff_out.dtype)
         ff_out = jax.nn.gelu(ff_out)
-        misc["gelu"] = ff_out
         ff_out = g_psum(self.ff_down_proj(ff_out))
-        misc["down"] = ff_out
-        print("down", ff_out.dtype)
-        return ff_out.astype(jnp.float16), misc
+        return ff_out
 
     # iterate the decoding process by a single token
     def decode_once(self, decode_state, x):
@@ -373,7 +366,7 @@ class ShardedTransformerLayer(nn.Module):
         # print("attn_out", attn_out)
         # -> 3 x [q_len=1, hidden]
 
-        ff_out, ff_misc = self.compute_ff(x)
+        ff_out = self.compute_ff(x)
         # print("ff_out", ff_out)
         # -> 3 x [q_len=1, hidden]
 
@@ -381,14 +374,6 @@ class ShardedTransformerLayer(nn.Module):
             "tokens_decoded": tokens_decoded,
             "k": k,
             "v": v
-        }, {
-            "x": x,
-            "attn_in": attn_in,
-            "k": k,
-            "attn_out": attn_out,
-            "ff_out": ff_out,
-            "final_out": (attn_out + ff_out),
-            "ff_misc": ff_misc,
         }
 
     # take in right aligned context tokens and generate an initial state
@@ -424,7 +409,7 @@ class ShardedTransformerLayer(nn.Module):
         ff_out = self.compute_ff(x)
         # -> [seq_len, hidden]
 
-        return g_psum(attn_out + ff_out), {
+        return attn_out + ff_out, {
             "tokens_decoded": given_length.astype(jnp.uint32),
             "k": k,
             "v": v,
