@@ -25,14 +25,13 @@ def generate(input_string: str,
         padded_input_ids[-input_ctx_length:] = input_ids
     else:
         padded_input_ids = np.array([0] * neox_model.generate_length + input_ids)
-    print(len(padded_input_ids))
 
     if rng is None:
         rng = jax.random.PRNGKey(np.random.randint(100000000))
     elif isinstance(rng, int):
         rng = jax.random.PRNGKey(rng)
 
-    if CACHED_FUNCS["generate"]:
+    if "generate" not in CACHED_FUNCS:
         CACHED_FUNCS["generate"] = jax.experimental.maps.xmap(
             neox_model.generate,
             in_axes=(
