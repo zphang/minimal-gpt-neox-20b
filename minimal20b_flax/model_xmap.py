@@ -285,7 +285,7 @@ class ShardedTransformerLayer(nn.Module):
         k = jnp.concatenate([k_rot, k_pass], axis=-1)
         q = jnp.concatenate([q_rot, q_pass], axis=-1)
 
-        attention_logits = jnp.einsum("thd,Thd->htT", q, k)
+        attention_logits = jnp.einsum("thd,Thd->htT", q.astype(jnp.float32), k.astype(jnp.float32))
         # -> [heads, q_len, kv_len]
 
         sqrt_key_size = np.sqrt(config.hidden_size // config.num_attention_heads).astype(k.dtype)
@@ -299,7 +299,7 @@ class ShardedTransformerLayer(nn.Module):
         attention_vec = jnp.einsum("htT,Thd->thd", attention_weights, v)
         # -> [q_len, heads, dims_per_head]
 
-        attention_vec = attention_vec.reshape(-1, self.dims_per_shard)
+        attention_vec = attention_vec.reshape(-1, self.dims_per_shard).astype(jnp.float16)
         # -> [q_len, hidden]
 
         attn_out = g_psum(self.output_proj(attention_vec))
