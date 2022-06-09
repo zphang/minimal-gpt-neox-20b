@@ -5,7 +5,7 @@ class RotaryEmbedding(torch.nn.Module):
 
     def __init__(self, dim, base=10000, device=None):
         super().__init__()
-        inv_freq = 1. / (base ** (torch.arange(0, dim, 2).float().to(device) / dim))
+        inv_freq = 1. / (base ** (torch.arange(0, dim, 2).half().to(device) / dim))
         self.register_buffer('inv_freq', inv_freq)
         # Delay initialization until first forward call, because initial model on the 'meta' device
         self.cos_cached = None

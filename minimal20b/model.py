@@ -9,20 +9,22 @@ class NeoX20BModel(nn.Module):
     def __init__(self, args, use_cache=False, device=None):
         super().__init__()
         self.use_cache = use_cache
-        self.embed_in = nn.Embedding(args.vocab_size, args.hidden_size, device=device)
+        self.embed_in = EmbeddingNoInit(args.vocab_size, args.hidden_size, device=device, dtype=torch.float16)
         self.layer_list = nn.ModuleList([])
         for layer_i in range(args.num_layers):
             self.layer_list.append(TransformerLayer(args, use_cache, device=device))
-        self.final_layer_norm = nn.LayerNorm(
+        self.final_layer_norm = LayerNormNoInit(
             args.hidden_size,
             eps=args.layernorm_epsilon,
             device=device,
+            dtype=torch.float16,
         )
-        self.logits_out = nn.Linear(
+        self.logits_out = LinearNoInit(
             args.hidden_size,
             args.vocab_size,
             bias=False,
             device=device,
+            dtype=torch.float16,
         )
 
     def forward(self, x, attention_mask=None, layer_past=None):
@@ -69,18 +71,20 @@ class TransformerLayer(nn.Module):
     def __init__(self, args, use_cache, device=None):
         super().__init__()
         self.use_cache = use_cache
-        self.input_layernorm = nn.LayerNorm(
+        self.input_layernorm = LayerNormNoInit(
             args.hidden_size,
             eps=args.layernorm_epsilon,
             device=device,
+            dtype=torch.float16,
         )
-        self.post_attention_layernorm = nn.LayerNorm(
+        self.post_attention_layernorm = LayerNormNoInit(
             args.hidden_size,
             eps=args.layernorm_epsilon,
             device=device,
+            dtype=torch.float16,
         )
         self.attention = SelfAttention(args, self.use_cache, device=device)
-        self.mlp = MLP(args)
+        self.mlp = MLP(args, device=device)
 
     def forward(self, x, attention_mask, layer_past=None):
         residual = x
@@ -109,16 +113,18 @@ class SelfAttention(nn.Module):
             base=args.rotary_emb_base,
             device=device,
         )
-        self.query_key_value = nn.Linear(
+        self.query_key_value = LinearNoInit(
             args.hidden_size,
             3 * args.hidden_size,
             device=device,
+            dtype=torch.float16,
         )
         self.norm_factor = math.sqrt(self.hidden_size_per_attention_head)
-        self.dense = nn.Linear(
+        self.dense = LinearNoInit(
             args.hidden_size,
             args.hidden_size,
             device=device,
+            dtype=torch.float16,
         )
 
     def forward(self, hidden_states, attention_mask, layer_past=None):
@@ -288,8 +294,8 @@ class MLP(nn.Module):
     def __init__(self, args, device=None):
         super().__init__()
         ff_dim = 4 * args.hidden_size
-        self.dense_h_to_4h = nn.Linear(args.hidden_size, ff_dim, device=device)
-        self.dense_4h_to_h = nn.Linear(ff_dim, args.hidden_size, device=device)
+        self.dense_h_to_4h = LinearNoInit(args.hidden_size, ff_dim, device=device, dtype=torch.float16)
+        self.dense_4h_to_h = LinearNoInit(ff_dim, args.hidden_size, device=device, dtype=torch.float16)
 
     def forward(self, hidden_states):
         intermediate_parallel = self.dense_h_to_4h(hidden_states)
@@ -344,3 +350,18 @@ def gelu_back(g, x):
             (1 - tanh_out * tanh_out) * (0.79788456 + 0.1070322243 * x * x)
     ) + 0.5 * (1 + tanh_out)
     return ff * g
+
+
+class EmbeddingNoInit(nn.Embedding):
+    def reset_parameters(self):
+        pass
+
+
+class LayerNormNoInit(nn.LayerNorm):
+    def reset_parameters(self):
+        pass
+
+
+class LinearNoInit(nn.Linear):
+    def reset_parameters(self):
+        pass
